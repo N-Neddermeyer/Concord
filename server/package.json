@@ -1,0 +1,14 @@
+{
+  "name": "server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/index.js",
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "node-sqlite3-wasm": "^0.8.61",
+    "express": "^5.1.0",
+    "ws": "^8.18.0"
+  }
+}

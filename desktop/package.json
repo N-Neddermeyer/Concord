@@ -1,0 +1,16 @@
+{
+  "name": "desktop",
+  "version": "0.2.0",
+  "description": "Casca desktop do Clone Local",
+  "author": "Clone Local",
+  "private": true,
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "installer": "node scripts/build-installer.js"
+  },
+  "devDependencies": {
+    "electron": "~44.9.3",
+    "electron-builder": "26.17.0"
+  }
+}
