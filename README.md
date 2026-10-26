@@ -20,15 +20,28 @@ Usuário de teste: **admin** / **123**.
 Para testar com duas pessoas, abra o app desktop e uma aba do navegador (ou duas abas: no
 navegador o login fica em `sessionStorage`, então cada aba pode ser um usuário diferente).
 
-### Testar a voz com uma segunda máquina (rede local)
+### Testar com uma segunda máquina (rede local)
 
-1. Na máquina servidor: `npm run start:lan` e libere a porta TCP 3001 no firewall.
-2. Gere o instalador já apontando para ela: `npm run installer` (usa o IP desta máquina) ou
-   `npm run installer -- http://IP:3001`. Sai em `release/Clone-Local-teste-Setup.exe`; a segunda
-   máquina não precisa de Node (o Electron já embute o seu).
-3. Alternativa sem instalador (com o projeto e `npm install`): `$env:CLONE_URL="http://IP:3001"; npm run desktop`.
-   O app trata essa origem como segura para liberar o microfone.
-4. No navegador, `http://IP:3001` não libera o microfone (exige HTTPS); use o app desktop.
+Nesta máquina (servidor):
+
+1. `npm run build` (se o cliente mudou) e `npm run lan:abrir` — pede UAC e cria regras de firewall
+   só para a sub-rede local (TCP 3001 e UDP do app de desenvolvimento). Não muda o perfil da rede.
+2. `npm run start:lan` — o terminal mostra os endereços (`na rede: http://IP:3001`).
+3. `npm run installer` gera `release/Clone-Local-teste-Setup.exe` já apontando para o IP desta
+   máquina (ou `npm run installer -- http://IP:3001`). Só precisa gerar de novo se o app desktop mudar.
+4. Para participar daqui também: `npm run desktop`.
+5. Ao terminar: pare o servidor (Ctrl+C) e rode `npm run lan:fechar`. `npm run lan:status` mostra o estado.
+
+Na segunda máquina: instale o `.exe` (não precisa de Node). Se o servidor não responder (IP mudou,
+servidor desligado), o app mostra **Não foi possível conectar** com o endereço editável — digite o
+novo (ex.: `192.168.0.10`, a porta 3001 é assumida) e ele reinicia já conectado. "Usar o padrão"
+volta ao endereço gravado no instalador. Alternativa sem instalador (com o projeto e `npm install`):
+`$env:CLONE_URL="http://IP:3001"; npm run desktop`.
+
+Voz, câmera e tela vão direto entre as máquinas (sem STUN/TURN): as duas precisam estar na mesma
+rede. O app usa os IPs reais nos candidatos (desliga o mascaramento mDNS do Chromium) e trata a
+origem `http://IP:3001` como segura para liberar microfone, câmera e tela. No navegador, `http://IP:3001`
+não libera esses dispositivos (exige HTTPS); use o app desktop.
 
 ## O que tem
 
@@ -65,6 +78,12 @@ navegador o login fica em `sessionStorage`, então cada aba pode ser um usuário
 - **Configurações do canal**: nome, tópico, excluir.
 - **Status**: Online, Ausente, Não perturbe (silencia notificações), Invisível.
 - **Voz**: mudo, ensurdecer, detecção de voz com anel verde, sons de entrar/sair.
+- **Vídeo e tela**: câmera e compartilhamento de tela na chamada de DM/grupo e no canal de voz do
+  servidor (que abre na área principal com a grade de participantes). Botão de chamada de vídeo no
+  cabeçalho da DM, Câmera/Tela no painel "Voz conectada", clique no bloco para ampliar, duplo clique
+  para tela cheia, selo "Ao vivo" e ícone de câmera na lista do canal. No desktop, o seletor de
+  "Compartilhar tela" (Aplicativos/Telas, 15/30/60 FPS); no navegador, o seletor do próprio navegador.
+  A tela vai sem áudio. Em Voz e vídeo: escolha da câmera e "Testar vídeo".
 
 Atalhos: `Ctrl+K` busca rápida, `Ctrl+Shift+M` mudo, `Ctrl+Shift+D` ensurdecer, `Esc` fecha
 configurações e modais; no desktop, `Ctrl+R` recarrega, `Ctrl+Shift+I` abre o DevTools e
@@ -101,7 +120,8 @@ primeira migração.
 - Sem logo própria por enquanto: o botão de início usa um ícone genérico e a bandeja um círculo.
 - Voz P2P em malha: boa para poucas pessoas na mesma rede. Para mais gente, troque por um SFU (LiveKit, mediasoup).
 - Sem STUN/TURN: funciona em `localhost` e na rede local, não pela internet.
-- Sem permissões por canal (overwrites), anexos, emojis personalizados, vídeo ou compartilhamento de tela.
+- Sem permissões por canal (overwrites), anexos ou emojis personalizados.
+- Vídeo em malha: cada um envia sua câmera/tela para cada participante, então pesa com muita gente.
 - Sem TLS: tráfego em `http`/`ws` e mensagens gravadas em texto puro no banco.
 - O servidor escuta só em `127.0.0.1` (`npm run start:lan` escuta na rede); no navegador o microfone
   exige HTTPS fora de `localhost` — use o app desktop.

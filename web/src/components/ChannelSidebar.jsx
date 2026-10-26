@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronRight, Hash, HeadphoneOff, LogOut, MicOff, Plus, Settings, UserPlus, Volume2, X } from 'lucide-react';
+import { ChevronDown, ChevronRight, Hash, HeadphoneOff, LogOut, MicOff, Plus, Settings, UserPlus, Video, Volume2, X } from 'lucide-react';
 import { api } from '../lib/api.js';
 import { closeMenu, confirmDialog, openMenu, openModal, openPopout, showError, useDialogs } from '../lib/dialogs.js';
 import { P, has, permissionsFor } from '../lib/permissions.js';
@@ -84,7 +84,13 @@ export default function ChannelSidebar({ guildId, activeChannelId }) {
             <div key={c.id}>
               <div className={`channel${active ? ' active' : ''}${unread ? ' unread' : ''}`}>
                 {unread && !active && <span className="channel-pill" />}
-                <button className="channel-main" onClick={() => (type === TEXT ? navigate(guildId, c.id) : voice.join(guildId, c.id))}>
+                <button
+                  className="channel-main"
+                  onClick={() => {
+                    navigate(guildId, c.id);
+                    if (type === VOICE) voice.join(guildId, c.id);
+                  }}
+                >
                   {type === TEXT ? <Hash size={20} className="channel-icon" /> : <Volume2 size={20} className="channel-icon" />}
                   <span className="channel-name">{c.name}</span>
                 </button>
@@ -111,6 +117,8 @@ export default function ChannelSidebar({ guildId, activeChannelId }) {
                   <Avatar user={users[v.user_id]} size={24} speaking={!!speaking[v.user_id]} />
                   <span className={speaking[v.user_id] ? 'speaking-name' : ''}>{displayName(users[v.user_id])}</span>
                   <span className="voice-flags">
+                    {v.self_stream && <span className="live-pill small">Ao vivo</span>}
+                    {v.self_video && <Video size={14} />}
                     {v.self_mute && !v.self_deaf && <MicOff size={14} />}
                     {v.self_deaf && <HeadphoneOff size={14} />}
                   </span>

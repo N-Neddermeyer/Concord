@@ -1,7 +1,7 @@
 import { AtSign, Hash, Phone, Pin, UserPlus, Users, Video, X } from 'lucide-react';
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../lib/api.js';
-import { acceptCall, startCall } from '../lib/calls.js';
+import { acceptCall, startCall, startVideoCall } from '../lib/calls.js';
 import { openPopout, showError, useDialogs } from '../lib/dialogs.js';
 import { isUserMessage } from '../lib/messages.js';
 import { P, has, memberColor, permissionsFor } from '../lib/permissions.js';
@@ -296,7 +296,13 @@ export default function Chat({ channelId }) {
             >
               <Phone size={22} />
             </button>
-            <button className="header-button" aria-label="Iniciar chamada de vídeo" title="Chamada de vídeo ainda não disponível no clone" disabled>
+            <button
+              className="header-button"
+              aria-label="Iniciar chamada de vídeo"
+              title="Iniciar chamada de vídeo"
+              disabled={blocked || (session.channelId === channelId && session.video)}
+              onClick={() => startVideoCall(channelId)}
+            >
               <Video size={24} />
             </button>
           </>

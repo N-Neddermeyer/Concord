@@ -12,6 +12,9 @@
     "start": "npm start -w server",
     "desktop": "npm start -w desktop",
     "start:lan": "npm start -w server -- --lan",
+    "lan:abrir": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/lan.ps1 abrir",
+    "lan:fechar": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/lan.ps1 fechar",
+    "lan:status": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/lan.ps1 status",
     "installer": "npm run installer -w desktop --"
   },
   "devDependencies": {

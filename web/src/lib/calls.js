@@ -12,6 +12,12 @@ import { voice } from './voice.js';
 
 export const startCall = (channelId) => voice.join(null, channelId);
 
+// Chamada de vídeo: a mesma chamada, já entrando com a câmera ligada.
+export async function startVideoCall(channelId) {
+  if (voice.channelId !== channelId) await voice.join(null, channelId);
+  if (voice.channelId === channelId && !voice.camera) await voice.toggleVideo();
+}
+
 export function acceptCall(channelId) {
   navigate(HOME, channelId);
   voice.join(null, channelId);

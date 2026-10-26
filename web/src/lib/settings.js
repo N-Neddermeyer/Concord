@@ -8,6 +8,7 @@ const DEFAULTS = {
   messageDisplay: 'cozy', // cozy | compact
   fontSize: 16,
   inputDevice: 'default',
+  videoDevice: 'default',
   outputDevice: 'default',
   outputVolume: 100,
   autoSensitivity: true,

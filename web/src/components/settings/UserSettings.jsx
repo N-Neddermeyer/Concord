@@ -1,4 +1,4 @@
-import { LogOut } from 'lucide-react';
+import { LogOut, VideoOff } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../../lib/api.js';
 import { confirmDialog, openModal, showError } from '../../lib/dialogs.js';
@@ -7,10 +7,11 @@ import { isDesktop, native } from '../../lib/native.js';
 import { updateSettings, useSettings } from '../../lib/settings.js';
 import { closeLayer, openLayer, useStore } from '../../lib/store.js';
 import { displayName } from '../../lib/util.js';
-import { levelOf, micConstraints } from '../../lib/voice.js';
+import { cameraConstraints, levelOf, micConstraints } from '../../lib/voice.js';
 import Avatar from '../Avatar.jsx';
 import { ChangePasswordModal, ChangeUsernameModal } from '../modals.jsx';
 import { ProfileCard } from '../UserPopout.jsx';
+import { VideoTrack } from '../VideoCall.jsx';
 import SettingsLayout, { SaveBar, ToggleRow, isDirty } from './SettingsLayout.jsx';
 
 export default function UserSettings({ section = 'account', onLogout, onToken }) {
@@ -257,12 +258,13 @@ function ZoomSlider() {
 // --- Voz e vídeo ---
 
 function useDevices() {
-  const [devices, setDevices] = useState({ input: [], output: [] });
+  const [devices, setDevices] = useState({ input: [], output: [], video: [] });
   useEffect(() => {
     const refresh = () =>
       navigator.mediaDevices.enumerateDevices().then((list) => setDevices({
         input: list.filter((d) => d.kind === 'audioinput' && d.deviceId !== 'default'),
         output: list.filter((d) => d.kind === 'audiooutput' && d.deviceId !== 'default'),
+        video: list.filter((d) => d.kind === 'videoinput'),
       }));
     refresh();
     navigator.mediaDevices.addEventListener('devicechange', refresh);
@@ -386,6 +388,59 @@ function VoiceSettings() {
       <ToggleRow title="Cancelamento de eco" checked={settings.echoCancellation} onChange={(echoCancellation) => updateSettings({ echoCancellation })} />
       <ToggleRow title="Supressão de ruído" description="Reduz ruídos de fundo do seu microfone." checked={settings.noiseSuppression} onChange={(noiseSuppression) => updateSettings({ noiseSuppression })} />
       <ToggleRow title="Controle automático de ganho" checked={settings.autoGainControl} onChange={(autoGainControl) => updateSettings({ autoGainControl })} />
+
+      <div className="divider" />
+      <VideoSettings devices={devices.video} />
+    </>
+  );
+}
+
+// Prévia da câmera escolhida, como em "Configurações de vídeo" do Discord.
+function VideoSettings({ devices }) {
+  const settings = useSettings();
+  const [preview, setPreview] = useState(null);
+  const current = useRef(null); // stream da prévia, para parar ao sair da página
+
+  const show = (stream) => {
+    current.current?.getTracks().forEach((t) => t.stop());
+    current.current = stream;
+    setPreview(stream);
+  };
+  const stop = () => show(null);
+  const start = async () => {
+    try {
+      show(await navigator.mediaDevices.getUserMedia(cameraConstraints()));
+    } catch (e) {
+      showError(`Não foi possível acessar a câmera: ${e.message}`);
+    }
+  };
+  useEffect(() => () => current.current?.getTracks().forEach((t) => t.stop()), []);
+  // Troca de câmera durante o teste: reabre a prévia com a nova.
+  useEffect(() => {
+    if (current.current) start();
+  }, [settings.videoDevice]);
+
+  return (
+    <>
+      <h2 className="page-title">Configurações de vídeo</h2>
+      <div className="camera-preview">
+        {preview ? (
+          <VideoTrack track={preview.getVideoTracks()[0]} mirror />
+        ) : (
+          <div className="camera-preview-empty">
+            <VideoOff size={40} />
+            <button className="button brand" onClick={start}>Testar vídeo</button>
+          </div>
+        )}
+      </div>
+      {preview && <button className="button secondary" onClick={stop}>Parar teste</button>}
+      <label className="field">
+        <span className="field-label">Câmera</span>
+        <select className="input" value={settings.videoDevice} onChange={(e) => updateSettings({ videoDevice: e.target.value })}>
+          <option value="default">Padrão</option>
+          {devices.map((d, i) => <option key={d.deviceId} value={d.deviceId}>{d.label || `Câmera ${i + 1}`}</option>)}
+        </select>
+      </label>
     </>
   );
 }

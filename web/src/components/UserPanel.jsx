@@ -1,10 +1,11 @@
-import { HeadphoneOff, Headphones, Mic, MicOff, PhoneOff, Settings, Signal } from 'lucide-react';
+import { HeadphoneOff, Headphones, Mic, MicOff, MonitorUp, PhoneOff, Settings, Signal, Video, VideoOff } from 'lucide-react';
 import { OP, gateway } from '../lib/gateway.js';
 import { openMenu } from '../lib/dialogs.js';
 import { HOME, isPrivate, navigate, openLayer, privateChannelName, useStore } from '../lib/store.js';
 import { STATUS_LABELS, displayName } from '../lib/util.js';
 import { useVoice, voice } from '../lib/voice.js';
 import Avatar from './Avatar.jsx';
+import { toggleScreenShare } from './VideoCall.jsx';
 
 const STATUS_OPTIONS = [
   ['online', null],
@@ -24,13 +25,25 @@ export function VoicePanel() {
 
   return (
     <div className="voice-panel">
-      <button className="voice-info" onClick={() => navigate(session.guildId ?? HOME, session.guildId ? undefined : session.channelId)}>
-        <div className="voice-connected"><Signal size={16} /> Voz conectada</div>
-        <div className="voice-where">{privateName ? (channel.type === 1 ? `@${privateName}` : privateName) : `${channel?.name} / ${guild?.name}`}</div>
-      </button>
-      <button className="panel-button" aria-label="Desconectar" title="Desconectar" onClick={() => voice.leave()}>
-        <PhoneOff size={20} />
-      </button>
+      <div className="voice-panel-row">
+        <button className="voice-info" onClick={() => navigate(session.guildId ?? HOME, session.channelId)}>
+          <div className="voice-connected"><Signal size={16} /> Voz conectada</div>
+          <div className="voice-where">{privateName ? (channel.type === 1 ? `@${privateName}` : privateName) : `${channel?.name} / ${guild?.name}`}</div>
+        </button>
+        <button className="panel-button" aria-label="Desconectar" title="Desconectar" onClick={() => voice.leave()}>
+          <PhoneOff size={20} />
+        </button>
+      </div>
+      <div className="voice-panel-actions">
+        <button className={`voice-action${session.video ? ' on' : ''}`} onClick={() => voice.toggleVideo()} title={session.video ? 'Desligar câmera' : 'Ligar câmera'}>
+          {session.video ? <Video size={20} /> : <VideoOff size={20} />}
+          <span>Câmera</span>
+        </button>
+        <button className={`voice-action${session.streaming ? ' on' : ''}`} onClick={toggleScreenShare} title={session.streaming ? 'Parar de transmitir' : 'Compartilhar tela'}>
+          <MonitorUp size={20} />
+          <span>{session.streaming ? 'Parar' : 'Tela'}</span>
+        </button>
+      </div>
     </div>
   );
 }

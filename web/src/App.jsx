@@ -15,6 +15,7 @@ import GuildSettings from './components/settings/GuildSettings.jsx';
 import UserSettings from './components/settings/UserSettings.jsx';
 import TitleBar from './components/TitleBar.jsx';
 import UserPanel, { VoicePanel } from './components/UserPanel.jsx';
+import VoiceChannelView from './components/VoiceChannelView.jsx';
 import { token } from './lib/api.js';
 import { closeAllModals, hasOpenModal, openModal } from './lib/dialogs.js';
 import { gateway } from './lib/gateway.js';
@@ -109,7 +110,7 @@ function Main({ onLogout, onToken }) {
   const guildId = nav.guildId === HOME || guilds[nav.guildId] ? nav.guildId : HOME;
   const isHome = guildId === HOME;
 
-  // Canal aberto: o escolhido por último, se ainda existir; senão o primeiro canal de texto.
+  // Canal aberto: o escolhido por último (texto ou voz), se ainda existir; senão o primeiro de texto.
   let channelId = nav.channels[guildId] ?? null;
   if (channelId && !channels[channelId]) channelId = null;
   if (!isHome && !channelId) {
@@ -117,16 +118,17 @@ function Main({ onLogout, onToken }) {
       .filter((c) => c.guild_id === guildId && c.type === 0)
       .sort((a, b) => a.position - b.position)[0]?.id ?? null;
   }
-  if (!isHome && channels[channelId]?.type !== 0) channelId = null;
+  if (!isHome && ![0, 2].includes(channels[channelId]?.type)) channelId = null;
 
   const channel = channels[channelId];
+  const isVoice = channel?.type === 2;
   const title = isHome
     ? (channel ? privateChannelName(state, channel) : 'Amigos')
     : guilds[guildId].name;
 
   useEffect(() => {
-    document.title = channel && !isHome ? `#${channel.name} | ${guilds[guildId].name}` : title;
-  }, [title, channel, isHome, guilds, guildId]);
+    document.title = channel && !isHome ? `${isVoice ? '' : '#'}${channel.name} | ${guilds[guildId].name}` : title;
+  }, [title, channel, isHome, isVoice, guilds, guildId]);
 
   return (
     <div className="app-shell">
@@ -146,9 +148,10 @@ function Main({ onLogout, onToken }) {
 
         <div className="main-content">
           {isHome && !channel && <FriendsPage />}
-          {channel && <Chat key={channelId} channelId={channelId} />}
+          {channel && !isVoice && <Chat key={channelId} channelId={channelId} />}
+          {isVoice && <VoiceChannelView key={channelId} channelId={channelId} />}
           {!isHome && !channel && <NoTextChannel />}
-          {!isHome && showMembers && channel && <MemberList guildId={guildId} />}
+          {!isHome && showMembers && channel && !isVoice && <MemberList guildId={guildId} />}
           {isHome && showMembers && channel?.type === 3 && <GroupMembers channel={channel} />}
         </div>
       </div>

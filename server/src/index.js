@@ -1,6 +1,7 @@
 import express from 'express';
 import { existsSync } from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { attachGateway } from './gateway.js';
@@ -29,4 +30,12 @@ app.use((err, _req, res, _next) => {
 
 const server = http.createServer(app);
 attachGateway(server);
-server.listen(PORT, HOST, () => console.log(`Servidor em http://${HOST}:${PORT}`));
+server.listen(PORT, HOST, () => {
+  console.log(`Servidor em http://${HOST}:${PORT}`);
+  if (HOST !== '0.0.0.0') return;
+  // Endereços para a segunda máquina digitar (ou para gerar o instalador).
+  const addresses = Object.values(os.networkInterfaces())
+    .flat()
+    .filter((a) => a.family === 'IPv4' && !a.internal && !a.address.startsWith('169.254.'));
+  for (const a of addresses) console.log(`  na rede: http://${a.address}:${PORT}`);
+});

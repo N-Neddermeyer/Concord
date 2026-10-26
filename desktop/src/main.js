@@ -1,14 +1,18 @@
 // Processo principal da casca desktop, no mesmo desenho do Discord: janela sem moldura
 // (a barra de título é desenhada pela página), splash enquanto o backend sobe, ícone na
 // bandeja ao fechar e uma ponte mínima (preload) para os controles da janela.
-const { app, BrowserWindow, Menu, Tray, ipcMain, nativeImage, session, shell } = require('electron');
+const { app, BrowserWindow, Menu, Tray, desktopCapturer, ipcMain, nativeImage, session, shell } = require('electron');
 const { fork } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 
-// Endereço do servidor: CLONE_URL > o gravado no build do instalador (cloneServerUrl) > local.
+// Endereço do servidor: CLONE_URL > o escolhido na tela de conexão (server.json no perfil) >
+// o gravado no build do instalador (cloneServerUrl) > local. Assim, se o IP do servidor mudar,
+// a segunda máquina só digita o novo endereço, sem gerar outro instalador.
 const { cloneServerUrl } = require('../package.json');
-const APP_URL = new URL(process.env.CLONE_URL ?? cloneServerUrl ?? 'http://127.0.0.1:3001');
+const DEFAULT_URL = cloneServerUrl ?? 'http://127.0.0.1:3001';
+const SERVER_FILE = path.join(app.getPath('userData'), 'server.json');
+const APP_URL = new URL(process.env.CLONE_URL ?? savedServerUrl() ?? DEFAULT_URL);
 const SERVER_ENTRY = path.join(__dirname, '..', '..', 'server', 'src', 'index.js');
 const STATE_FILE = path.join(app.getPath('userData'), 'window-state.json');
 const BACKGROUND = '#1e1f22';
@@ -18,12 +22,24 @@ let splashWindow = null;
 let tray = null;
 let serverProcess = null;
 let quitting = false;
+let pendingScreenSource = null; // fonte escolhida no seletor da página para o próximo getDisplayMedia
 
-// Microfone exige contexto seguro (HTTPS ou localhost). Para testar na rede local com um
-// servidor em http://IP:porta, tratamos só essa origem como segura.
+function savedServerUrl() {
+  try {
+    return new URL(JSON.parse(fs.readFileSync(SERVER_FILE, 'utf8')).url).origin;
+  } catch {
+    return null;
+  }
+}
+
+// Microfone, câmera e tela exigem contexto seguro (HTTPS ou localhost). Para testar na rede local
+// com um servidor em http://IP:porta, tratamos só essa origem como segura.
 if (APP_URL.protocol === 'http:' && !['127.0.0.1', 'localhost'].includes(APP_URL.hostname)) {
   app.commandLine.appendSwitch('unsafely-treat-insecure-origin-as-secure', APP_URL.origin);
 }
+// Sem STUN, a voz/vídeo entre máquinas depende dos IPs locais nos candidatos ICE. O Chromium os
+// esconde atrás de nomes .local (mDNS), que muitas redes Windows não resolvem; aqui usamos o IP real.
+app.commandLine.appendSwitch('disable-features', 'WebRtcHideLocalIpsWithMdns');
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
@@ -85,7 +101,9 @@ async function ensureServer(setStatus) {
   } else {
     setStatus('Conectando ao servidor…');
   }
-  for (let i = 0; i < 60; i++) {
+  // Servidor local: tempo para subir. Remoto: se não responder logo, mostra o formulário de endereço.
+  const deadline = Date.now() + (local ? 15000 : 8000);
+  while (Date.now() < deadline) {
     if (await isServerUp()) return;
     await new Promise((r) => setTimeout(r, 250));
   }
@@ -96,15 +114,15 @@ async function ensureServer(setStatus) {
 
 function createSplash() {
   splashWindow = new BrowserWindow({
-    width: 300,
-    height: 350,
+    width: 340,
+    height: 380,
     frame: false,
     resizable: false,
     center: true,
     show: false,
     skipTaskbar: true,
     backgroundColor: BACKGROUND,
-    webPreferences: { sandbox: true, contextIsolation: true },
+    webPreferences: { sandbox: true, contextIsolation: true, preload: path.join(__dirname, 'splash-preload.js') },
   });
   splashWindow.loadFile(path.join(__dirname, 'splash.html'));
   splashWindow.once('ready-to-show', () => splashWindow?.show());
@@ -113,6 +131,34 @@ function createSplash() {
 
 function setSplashStatus(text) {
   splashWindow?.webContents.executeJavaScript(`window.setStatus(${JSON.stringify(text)})`).catch(() => {});
+}
+
+// Servidor fora do ar ou endereço errado: a splash mostra o endereço para corrigir.
+function showServerForm(message) {
+  const args = JSON.stringify({ message, url: APP_URL.origin, fallback: DEFAULT_URL });
+  splashWindow?.webContents.executeJavaScript(`window.showServerForm(${args})`).catch(() => {});
+}
+
+// Gravar o novo endereço e reiniciar: a origem segura (acima) só vale a partir da inicialização.
+function changeServer(value) {
+  let url = null;
+  if (value) {
+    try {
+      const parsed = new URL(/^https?:\/\//i.test(value) ? value : `http://${value}`);
+      if (!parsed.port && !/:\d+\/?$/.test(value)) parsed.port = '3001'; // sem porta: a padrão do servidor
+      url = parsed.origin;
+    } catch {
+      return showServerForm('Endereço inválido. Use o formato 192.168.0.10:3001');
+    }
+  }
+  try {
+    if (url) fs.writeFileSync(SERVER_FILE, JSON.stringify({ url }));
+    else fs.rmSync(SERVER_FILE, { force: true });
+  } catch (e) {
+    return showServerForm(`Não foi possível salvar: ${e.message}`);
+  }
+  app.relaunch();
+  app.exit(0);
 }
 
 function createMainWindow() {
@@ -288,6 +334,30 @@ function registerIpc() {
   });
   handle('CLONE_WINDOW_IS_MAXIMIZED', () => mainWindow.isMaximized());
   handle('CLONE_WINDOW_GET_ZOOM', () => mainWindow.webContents.getZoomFactor());
+  // Compartilhar tela: a página lista as fontes (com miniatura), mostra o seletor no estilo do
+  // Discord e escolhe uma; o getDisplayMedia seguinte usa essa fonte (setDisplayMediaRequestHandler).
+  handle('CLONE_SCREEN_GET_SOURCES', async () => {
+    const sources = await desktopCapturer.getSources({
+      types: ['window', 'screen'],
+      thumbnailSize: { width: 320, height: 180 },
+      fetchWindowIcons: true,
+    });
+    return sources
+      .filter((s) => !mainWindow || s.id !== mainWindow.getMediaSourceId())
+      .map((s) => ({
+        id: s.id,
+        name: s.name,
+        kind: s.id.startsWith('screen:') ? 'screen' : 'window',
+        thumbnail: s.thumbnail.toDataURL(),
+        icon: s.appIcon?.toDataURL() ?? null,
+      }));
+  });
+  on('CLONE_SCREEN_SELECT', (id) => (pendingScreenSource = typeof id === 'string' ? id : null));
+
+  // Tela de conexão (splash): trocar o servidor ou sair.
+  const fromSplash = (event) => splashWindow && event.sender === splashWindow.webContents;
+  ipcMain.on('CLONE_SPLASH_SET_SERVER', (event, value) => fromSplash(event) && changeServer(String(value ?? '').trim()));
+  ipcMain.on('CLONE_SPLASH_QUIT', (event) => fromSplash(event) && app.quit());
   handle('CLONE_APP_GET_INFO', () => ({
     version: app.getVersion(),
     electron: process.versions.electron,
@@ -297,7 +367,7 @@ function registerIpc() {
   }));
 }
 
-// Microfone e notificações só para a origem do app; todo o resto é negado.
+// Microfone, câmera, tela e notificações só para a origem do app; todo o resto é negado.
 function configurePermissions() {
   const allowed = new Set(['media', 'notifications', 'clipboard-sanitized-write', 'speaker-selection']);
   const fromApp = (url) => {
@@ -308,10 +378,18 @@ function configurePermissions() {
     }
   };
   session.defaultSession.setPermissionRequestHandler((contents, permission, callback, details) => {
-    const videoRequested = details.mediaTypes?.includes('video');
-    callback(fromApp(details.requestingUrl ?? contents.getURL()) && allowed.has(permission) && !videoRequested);
+    callback(fromApp(details.requestingUrl ?? contents.getURL()) && allowed.has(permission));
   });
   session.defaultSession.setPermissionCheckHandler((_contents, permission, origin) => fromApp(origin) && allowed.has(permission));
+  session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
+    const id = pendingScreenSource;
+    pendingScreenSource = null;
+    if (!fromApp(request.securityOrigin ?? request.frame?.url) || !id) return callback({});
+    const sources = await desktopCapturer.getSources({ types: ['window', 'screen'], thumbnailSize: { width: 0, height: 0 } });
+    const source = sources.find((s) => s.id === id);
+    // Sem áudio: o loopback do sistema incluiria as vozes da própria chamada (eco para os outros).
+    callback(source ? { video: source } : {});
+  });
 }
 
 async function start() {
@@ -325,8 +403,7 @@ async function start() {
     setSplashStatus('Iniciando…');
     createMainWindow();
   } catch (e) {
-    setSplashStatus(e.message);
-    setTimeout(() => app.quit(), 6000);
+    showServerForm(e.message);
   }
 }
 

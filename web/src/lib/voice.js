@@ -11,6 +11,10 @@ import { dispatch, getState } from './store.js';
 //
 // Como no Discord, a transmissão é por detecção de voz: o microfone bruto alimenta o
 // medidor, e uma cópia da trilha (a enviada aos outros) só fica ativa enquanto há fala.
+//
+// Cada conexão nasce com três transceptores fixos (áudio, câmera e tela, nessa ordem), e
+// ligar ou desligar a câmera/tela só troca a trilha (replaceTrack), sem renegociar. Quem
+// mostra ou esconde o vídeo é o estado de voz (self_video / self_stream), como no Discord.
 
 const AUTO_THRESHOLD = 0.015;
 const SPEAKING_HOLD_MS = 400;
@@ -19,6 +23,20 @@ const threshold = () => {
   const s = getSettings();
   return s.autoSensitivity ? AUTO_THRESHOLD : 10 ** (s.sensitivity / 20);
 };
+
+const VIDEO_SLOTS = ['camera', 'screen']; // transceptores 1 e 2 (o 0 é o áudio)
+
+export function cameraConstraints() {
+  const { videoDevice } = getSettings();
+  return {
+    video: {
+      deviceId: videoDevice !== 'default' ? { exact: videoDevice } : undefined,
+      width: { ideal: 1280 },
+      height: { ideal: 720 },
+      frameRate: { ideal: 30 },
+    },
+  };
+}
 
 export function micConstraints() {
   const s = getSettings();
@@ -51,26 +69,39 @@ class Voice {
   sendStream = null;
   gateOpen = false;
   confirmed = false;
-  peers = new Map(); // userId -> { pc, audio, pendingIce }
+  camera = null; // trilha da câmera, quando ligada
+  screen = null; // trilha da tela compartilhada, quando ligada
+  peers = new Map(); // userId -> { pc, audio, pendingIce, video: { camera, screen } }
   meters = new Map(); // userId -> { analyser, source, buffer, speaking, lastLoud }
   audioContext = null;
   timer = null;
   listeners = new Set();
-  snapshot = { guildId: null, channelId: null, muted: false, deafened: false };
+  snapshot = { guildId: null, channelId: null, muted: false, deafened: false, video: false, streaming: false, tracks: 0 };
+  trackVersion = 0; // muda a cada trilha de vídeo nova (local ou remota), para a interface reler
 
   constructor() {
     gateway.on((t, d) => this.onEvent(t, d));
     let previous = getSettings();
     onSettingsChange((s) => {
       const micChanged = ['inputDevice', 'echoCancellation', 'noiseSuppression', 'autoGainControl'].some((k) => s[k] !== previous[k]);
+      const cameraChanged = s.videoDevice !== previous.videoDevice;
       previous = s;
       if (micChanged && this.mic) this.reopenMic();
+      if (cameraChanged && this.camera) this.reopenCamera();
       this.applyOutput();
     });
   }
 
   emit() {
-    this.snapshot = { guildId: this.guildId, channelId: this.channelId, muted: this.muted, deafened: this.deafened };
+    this.snapshot = {
+      guildId: this.guildId,
+      channelId: this.channelId,
+      muted: this.muted,
+      deafened: this.deafened,
+      video: !!this.camera,
+      streaming: !!this.screen,
+      tracks: this.trackVersion,
+    };
     for (const listener of this.listeners) listener();
   }
 
@@ -133,7 +164,70 @@ class Voice {
       channel_id: this.channelId,
       self_mute: this.muted,
       self_deaf: this.deafened,
+      self_video: !!this.camera,
+      self_stream: !!this.screen,
     });
+  }
+
+  // --- câmera e tela ---
+
+  // Trilha de vídeo de alguém na chamada (eu incluso): 'camera' ou 'screen'.
+  videoTrack(userId, slot) {
+    if (userId === getState().user?.id) return this[slot];
+    return this.peers.get(userId)?.video[slot] ?? null;
+  }
+
+  setVideo(slot, track) {
+    const old = this[slot];
+    this[slot] = track;
+    if (old && old !== track) old.stop();
+    const index = VIDEO_SLOTS.indexOf(slot) + 1;
+    for (const { pc } of this.peers.values()) pc.getTransceivers()[index]?.sender.replaceTrack(track).catch(() => {});
+    this.trackVersion++;
+    this.sendState();
+    this.emit();
+  }
+
+  async toggleVideo() {
+    if (!this.channelId) return;
+    if (this.camera) return this.setVideo('camera', null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia(cameraConstraints());
+      if (!this.channelId) return stream.getTracks().forEach((t) => t.stop());
+      this.setVideo('camera', stream.getVideoTracks()[0]);
+    } catch (e) {
+      showError(`Não foi possível acessar a câmera: ${e.message}`);
+    }
+  }
+
+  async reopenCamera() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia(cameraConstraints());
+      if (!this.camera) return stream.getTracks().forEach((t) => t.stop());
+      this.setVideo('camera', stream.getVideoTracks()[0]);
+    } catch (e) {
+      showError(`Não foi possível trocar a câmera: ${e.message}`);
+    }
+  }
+
+  // No desktop a fonte já foi escolhida no seletor (native.screen.select) antes desta chamada;
+  // no navegador, o próprio getDisplayMedia mostra o seletor.
+  async startScreen({ frameRate = 30 } = {}) {
+    if (!this.channelId) return;
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: frameRate } }, audio: false });
+      const track = stream.getVideoTracks()[0];
+      if (!this.channelId) return track.stop();
+      track.contentHint = 'detail'; // prioriza nitidez do texto sobre fluidez
+      track.addEventListener('ended', () => this.screen === track && this.setVideo('screen', null));
+      this.setVideo('screen', track);
+    } catch (e) {
+      if (e.name !== 'NotAllowedError' && e.name !== 'AbortError') showError(`Não foi possível compartilhar a tela: ${e.message}`);
+    }
+  }
+
+  stopScreen() {
+    if (this.screen) this.setVideo('screen', null);
   }
 
   // Desativar o mudo enquanto ensurdecido também tira o ensurdecer (como no Discord).
@@ -189,6 +283,11 @@ class Voice {
     for (const userId of [...this.meters.keys()]) this.unwatch(userId);
     this.mic?.getTracks().forEach((track) => track.stop());
     this.sendTrack?.stop();
+    this.camera?.stop();
+    this.screen?.stop();
+    this.camera = null;
+    this.screen = null;
+    this.trackVersion++;
     this.mic = null;
     this.sendTrack = null;
     this.sendStream = null;
@@ -227,20 +326,35 @@ class Voice {
     }
   }
 
-  createPeer(userId) {
+  // Quem oferta cria os transceptores (áudio, câmera, tela); quem responde os recebe da oferta
+  // e só preenche as trilhas (attachTracks), na mesma ordem.
+  createPeer(userId, offering) {
     const pc = new RTCPeerConnection({ iceServers: [] }); // rede local: candidatos "host" bastam
-    const peer = { pc, audio: null, pendingIce: [] };
+    const peer = { pc, audio: null, pendingIce: [], video: { camera: null, screen: null } };
     this.peers.set(userId, peer);
 
-    pc.addTrack(this.sendTrack, this.sendStream);
+    if (offering) {
+      pc.addTransceiver('audio', { direction: 'sendrecv', streams: [this.sendStream] });
+      for (const _ of VIDEO_SLOTS) pc.addTransceiver('video', { direction: 'sendrecv' });
+      this.attachTracks(pc);
+    }
     pc.onicecandidate = (e) => e.candidate && this.signal(userId, { type: 'ice', candidate: e.candidate });
     pc.ontrack = (e) => {
+      if (e.track.kind === 'video') {
+        const slot = VIDEO_SLOTS[pc.getTransceivers().indexOf(e.transceiver) - 1];
+        if (!slot) return;
+        peer.video[slot] = e.track;
+        this.trackVersion++;
+        this.emit();
+        return;
+      }
       if (peer.audio) return;
+      const stream = new MediaStream([e.track]);
       peer.audio = new Audio();
-      peer.audio.srcObject = e.streams[0];
+      peer.audio.srcObject = stream;
       this.applyOutput();
       peer.audio.play().catch(() => {});
-      this.watch(userId, e.streams[0]);
+      this.watch(userId, stream);
     };
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === 'failed') this.closePeer(userId);
@@ -248,8 +362,19 @@ class Voice {
     return peer;
   }
 
+  attachTracks(pc) {
+    const [audio, ...videos] = pc.getTransceivers();
+    audio.direction = 'sendrecv';
+    audio.sender.replaceTrack(this.sendTrack).catch(() => {});
+    VIDEO_SLOTS.forEach((slot, i) => {
+      if (!videos[i]) return;
+      videos[i].direction = 'sendrecv';
+      videos[i].sender.replaceTrack(this[slot]).catch(() => {});
+    });
+  }
+
   async call(userId) {
-    const peer = this.createPeer(userId);
+    const peer = this.createPeer(userId, true);
     await peer.pc.setLocalDescription(await peer.pc.createOffer());
     this.signal(userId, { type: 'offer', sdp: peer.pc.localDescription });
   }
@@ -260,8 +385,9 @@ class Voice {
 
     if (message.type === 'offer') {
       if (peer) this.closePeer(from);
-      peer = this.createPeer(from);
+      peer = this.createPeer(from, false);
       await peer.pc.setRemoteDescription(message.sdp);
+      this.attachTracks(peer.pc);
       await this.flushIce(peer);
       await peer.pc.setLocalDescription(await peer.pc.createAnswer());
       this.signal(from, { type: 'answer', sdp: peer.pc.localDescription });
@@ -288,6 +414,10 @@ class Voice {
     peer.pc.close();
     if (peer.audio) peer.audio.srcObject = null;
     this.peers.delete(userId);
+    if (peer.video.camera || peer.video.screen) {
+      this.trackVersion++;
+      this.emit();
+    }
     this.unwatch(userId);
   }
 

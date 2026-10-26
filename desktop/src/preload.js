@@ -22,4 +22,8 @@ contextBridge.exposeInMainWorld('CloneNative', {
   app: {
     getInfo: () => ipcRenderer.invoke('CLONE_APP_GET_INFO'),
   },
+  screen: {
+    getSources: () => ipcRenderer.invoke('CLONE_SCREEN_GET_SOURCES'),
+    select: (id) => ipcRenderer.send('CLONE_SCREEN_SELECT', String(id)),
+  },
 });

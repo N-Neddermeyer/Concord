@@ -83,8 +83,8 @@ export function rankOf(guild, userId) {
 
 // --- formatos enviados ao cliente ---
 
-const publicVoice = ({ guild_id, channel_id, user_id, self_mute, self_deaf }) => ({
-  guild_id, channel_id, user_id, self_mute, self_deaf,
+const publicVoice = ({ guild_id, channel_id, user_id, self_mute, self_deaf, self_video, self_stream }) => ({
+  guild_id, channel_id, user_id, self_mute, self_deaf, self_video, self_stream,
 });
 
 export const toRole = (r) => ({ ...r, hoist: !!r.hoist });
@@ -151,7 +151,7 @@ export function leaveVoice(userId) {
   const state = voiceStates.get(userId);
   if (!state) return;
   voiceStates.delete(userId);
-  dispatchVoice(state, { ...publicVoice(state), channel_id: null, self_mute: false, self_deaf: false });
+  dispatchVoice(state, { ...publicVoice(state), channel_id: null, self_mute: false, self_deaf: false, self_video: false, self_stream: false });
   // Quem foi removido do servidor não recebe mais eventos dele; avisa diretamente.
   if (state.guild_id && !q.member.get(state.guild_id, userId)) {
     dispatchToUser(userId, 'VOICE_STATE_UPDATE', { ...publicVoice(state), channel_id: null });
@@ -282,6 +282,9 @@ function handleVoiceStateUpdate(ws, d) {
     user_id: user.id,
     self_mute: !!d.self_mute || !!d.self_deaf,
     self_deaf: !!d.self_deaf,
+    // Câmera e transmissão de tela, como self_video/self_stream do Discord.
+    self_video: !!d.self_video,
+    self_stream: !!d.self_stream,
     ws,
   };
   voiceStates.set(user.id, state);
