@@ -2,7 +2,7 @@ import { gateway } from './gateway.js';
 import { native } from './native.js';
 import { getSettings } from './settings.js';
 import { playSound } from './sounds.js';
-import { HOME, REL, getState, navigate, privateChannelName } from './store.js';
+import { HOME, REL, getState, memberName, navigate, privateChannelName } from './store.js';
 import { displayName } from './util.js';
 
 // Notifica DMs e menções (padrão do Discord), a menos que o canal esteja aberto com a janela em foco.
@@ -24,7 +24,7 @@ gateway.on((t, d) => {
   if (!getSettings().desktopNotifications || !('Notification' in window) || Notification.permission !== 'granted') return;
 
   const title = channel?.guild_id
-    ? `${displayName(d.author)} (#${channel.name}, ${s.guilds[channel.guild_id]?.name})`
+    ? `${memberName(s, channel.guild_id, d.author.id, d.author)} (#${channel.name}, ${s.guilds[channel.guild_id]?.name})`
     : channel?.type === 3 ? `${displayName(d.author)} (${privateChannelName(s, channel)})` : displayName(d.author);
   const files = d.attachments?.length ?? 0;
   const body = d.content || (files ? `Enviou ${files === 1 ? 'um anexo' : `${files} anexos`}.` : '');

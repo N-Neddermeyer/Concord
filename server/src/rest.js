@@ -1,22 +1,26 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import express, { Router } from 'express';
 import { hashPassword, newToken, verifyPassword } from './auth.js';
 import {
-  ATTACHMENTS_DIR, CHANNEL_DM, CHANNEL_GROUP_DM, CHANNEL_TEXT, CHANNEL_VOICE, MSG, REL, db, loadMessages, messagePayload, privateUser,
-  publicUser, q,
+  ATTACHMENTS_DIR, CHANNEL_CATEGORY, CHANNEL_DM, CHANNEL_GROUP_DM, CHANNEL_TEXT, CHANNEL_VOICE, MSG, REL, db, loadMessages, messagePayload,
+  privateUser, publicUser, q, toChannel, toOverwrite,
 } from './db.js';
 import {
   broadcastPresence,
   buildDmChannel,
   buildGuild,
   buildMember,
+  channelPermissionsOf,
   disconnectVoice,
   dispatchToChannel,
   dispatchToGuild,
+  dispatchToGuildWith,
   dispatchToUser,
   dispatchToUsers,
+  forgetGuild,
+  guildFields,
   isInCall,
   leaveVoice,
   permissionsOf,
@@ -25,9 +29,12 @@ import {
   ringCall,
   statusOf,
   stopRinging,
+  syncChannels,
   toRole,
 } from './gateway.js';
-import { ALL_PERMISSIONS, DEFAULT_PERMISSIONS, P, has } from './permissions.js';
+import {
+  ALL_PERMISSIONS, CHANNEL_PERMISSIONS, DEFAULT_PERMISSIONS, OVERWRITE_MEMBER, OVERWRITE_ROLE, P, has,
+} from './permissions.js';
 import { snowflake } from './snowflake.js';
 
 export const api = Router();
@@ -50,13 +57,14 @@ const now = () => new Date().toISOString();
 
 // Erro com status HTTP: as rotas lançam e o handler no fim do arquivo responde.
 class HttpError extends Error {
-  constructor(status, message) {
+  constructor(status, message, extra) {
     super(message);
     this.status = status;
+    this.extra = extra;
   }
 }
-const fail = (status, message) => {
-  throw new HttpError(status, message);
+const fail = (status, message, extra) => {
+  throw new HttpError(status, message, extra);
 };
 
 const validImage = (value) => value === null || (typeof value === 'string' && value.length <= MAX_IMAGE_LENGTH && IMAGE_DATA_URL.test(value));
@@ -104,11 +112,11 @@ function loadGuild(req, permission) {
   return { guild, perms };
 }
 
-// Canal que o usuário pode ver: canal de servidor do qual é membro, ou DM da qual participa.
+// Canal que o usuário pode ver: canal de servidor com "Ver canal", ou DM da qual participa.
 function loadChannel(req) {
   const channel = q.channel.get(req.params.channelId);
   const visible = channel && (channel.guild_id
-    ? q.member.get(channel.guild_id, req.user.id)
+    ? has(channelPermissionsOf(channel, req.user.id), P.VIEW_CHANNEL)
     : q.dmRecipient.get(channel.id, req.user.id));
   if (!visible) fail(404, 'Canal não encontrado.');
   return channel;
@@ -377,7 +385,99 @@ api.post('/channels/:channelId/call/stop-ringing', (req, res) => {
   res.status(204).end();
 });
 
+// --- registro de auditoria (mesmos action_type do Discord) ---
+
+const AUDIT = {
+  GUILD_UPDATE: 1,
+  CHANNEL_CREATE: 10,
+  CHANNEL_UPDATE: 11,
+  CHANNEL_DELETE: 12,
+  CHANNEL_OVERWRITE_CREATE: 13,
+  CHANNEL_OVERWRITE_UPDATE: 14,
+  CHANNEL_OVERWRITE_DELETE: 15,
+  MEMBER_KICK: 20,
+  MEMBER_BAN_ADD: 22,
+  MEMBER_BAN_REMOVE: 23,
+  MEMBER_UPDATE: 24,
+  MEMBER_ROLE_UPDATE: 25,
+  ROLE_CREATE: 30,
+  ROLE_UPDATE: 31,
+  ROLE_DELETE: 32,
+  INVITE_CREATE: 40,
+  INVITE_DELETE: 42,
+  MESSAGE_DELETE: 72,
+  MESSAGE_PIN: 74,
+  MESSAGE_UNPIN: 75,
+};
+const AUDIT_ACTIONS = new Set(Object.values(AUDIT));
+
+const toAuditEntry = (row) => ({
+  id: row.id,
+  user_id: row.user_id,
+  target_id: row.target_id,
+  action_type: row.action_type,
+  changes: row.changes ? JSON.parse(row.changes) : undefined,
+  options: row.options ? JSON.parse(row.options) : undefined,
+  reason: row.reason ?? undefined,
+});
+
+function audit(guildId, userId, action, { target = null, changes = null, options = null, reason = null } = {}) {
+  const row = {
+    id: snowflake(),
+    user_id: userId,
+    target_id: target,
+    action_type: action,
+    changes: changes?.length ? JSON.stringify(changes) : null,
+    options: options ? JSON.stringify(options) : null,
+    reason: reason || null,
+  };
+  q.insertAudit.run(row.id, guildId, row.user_id, row.target_id, row.action_type, row.changes, row.options, row.reason);
+  dispatchToGuildWith(guildId, P.VIEW_AUDIT_LOG, 'GUILD_AUDIT_LOG_ENTRY_CREATE', { guild_id: guildId, ...toAuditEntry(row) });
+}
+
+// Imagens entram no registro como hash (como o icon_hash do Discord), não como o data URL inteiro.
+const imageHash = (value) => (value ? createHash('sha1').update(value).digest('hex').slice(0, 16) : null);
+
+// [{ key, old_value, new_value }] só com o que mudou.
+function diff(before, after, keys) {
+  const changes = [];
+  for (const key of keys) {
+    const a = before?.[key] ?? null;
+    const b = after?.[key] ?? null;
+    if (JSON.stringify(a) !== JSON.stringify(b)) changes.push({ key, ...(a !== null && { old_value: a }), ...(b !== null && { new_value: b }) });
+  }
+  return changes;
+}
+
+api.get('/guilds/:guildId/audit-logs', (req, res) => {
+  const { guild } = loadGuild(req, P.VIEW_AUDIT_LOG);
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 100);
+  const action = req.query.action_type === undefined ? null : Number(req.query.action_type);
+  if (action !== null && !AUDIT_ACTIONS.has(action)) fail(400, 'Tipo de ação inválido.');
+  const rows = q.auditLog.all({
+    guild: guild.id,
+    user: typeof req.query.user_id === 'string' ? req.query.user_id : null,
+    action,
+    before: typeof req.query.before === 'string' ? req.query.before : null,
+    limit,
+  });
+  const entries = rows.map(toAuditEntry);
+  const userIds = new Set(entries.flatMap((e) => [e.user_id, e.target_id]).filter(Boolean));
+  const users = [...userIds].map((id) => q.userById.get(id)).filter(Boolean).map((u) => publicUser(u));
+  res.json({ audit_log_entries: entries, users });
+});
+
 // --- servidores ---
+
+const SUPPRESS_JOIN_NOTIFICATIONS = 1 << 0;
+const MAX_BANNER_LENGTH = 800_000;
+
+// Manda o servidor completo (só com os canais visíveis) para o membro.
+function sendGuild(userId, guildId) {
+  const guild = buildGuild(q.guild.get(guildId), userId);
+  dispatchToUser(userId, 'GUILD_CREATE', guild);
+  return guild;
+}
 
 api.post('/guilds', (req, res) => {
   const name = String(req.body?.name ?? '').trim();
@@ -385,30 +485,56 @@ api.post('/guilds', (req, res) => {
   const icon = req.body?.icon ?? null;
   if (!validImage(icon)) fail(400, 'Ícone inválido ou grande demais.');
 
+  // Mesmo ponto de partida do Discord: categorias de texto e de voz, #geral e o canal de voz Geral.
   const guildId = snowflake();
   db.transaction(() => {
+    const textCategory = snowflake();
+    const voiceCategory = snowflake();
+    const general = snowflake();
     q.insertGuild.run(guildId, name, req.user.id);
-    q.updateGuild.run(name, icon, guildId);
     q.insertRole.run(guildId, guildId, '@everyone', null, DEFAULT_PERMISSIONS, 0, 0);
     q.insertMember.run(guildId, req.user.id, now());
-    q.insertChannel.run(snowflake(), guildId, 'geral', CHANNEL_TEXT, 0);
-    q.insertChannel.run(snowflake(), guildId, 'Geral', CHANNEL_VOICE, 1);
+    q.insertChannel.run(textCategory, guildId, 'Canais de texto', CHANNEL_CATEGORY, 0, null);
+    q.insertChannel.run(voiceCategory, guildId, 'Canais de voz', CHANNEL_CATEGORY, 1, null);
+    q.insertChannel.run(general, guildId, 'geral', CHANNEL_TEXT, 0, textCategory);
+    q.insertChannel.run(snowflake(), guildId, 'Geral', CHANNEL_VOICE, 0, voiceCategory);
+    q.updateGuild.run(name, icon, null, general, 0, guildId);
   })();
 
-  const guild = buildGuild(q.guild.get(guildId));
-  dispatchToUser(req.user.id, 'GUILD_CREATE', guild);
-  res.status(201).json(guild);
+  res.status(201).json(sendGuild(req.user.id, guildId));
 });
 
 api.patch('/guilds/:guildId', (req, res) => {
   const { guild } = loadGuild(req, P.MANAGE_GUILD);
-  const name = req.body?.name === undefined ? guild.name : String(req.body.name).trim();
-  if (name.length < 1 || name.length > 100) fail(400, 'Nome do servidor: 1 a 100 caracteres.');
-  const icon = req.body?.icon === undefined ? guild.icon : req.body.icon;
-  if (!validImage(icon)) fail(400, 'Ícone inválido ou grande demais.');
+  const body = req.body ?? {};
+  const next = { ...guild };
+  if (body.name !== undefined) next.name = String(body.name).trim();
+  if (next.name.length < 1 || next.name.length > 100) fail(400, 'Nome do servidor: 1 a 100 caracteres.');
+  if (body.icon !== undefined) next.icon = body.icon;
+  if (!validImage(next.icon)) fail(400, 'Ícone inválido ou grande demais.');
+  if (body.banner !== undefined) {
+    if (body.banner !== null && (typeof body.banner !== 'string' || body.banner.length > MAX_BANNER_LENGTH || !IMAGE_DATA_URL.test(body.banner))) {
+      fail(400, 'Banner inválido ou grande demais.');
+    }
+    next.banner = body.banner;
+  }
+  if (body.system_channel_id !== undefined) {
+    const channel = body.system_channel_id === null ? null : q.channel.get(String(body.system_channel_id));
+    if (body.system_channel_id !== null && (!channel || channel.guild_id !== guild.id || channel.type !== CHANNEL_TEXT)) {
+      fail(400, 'Canal de mensagens do sistema inválido.');
+    }
+    next.system_channel_id = channel?.id ?? null;
+  }
+  if (body.system_channel_flags !== undefined) next.system_channel_flags = Number(body.system_channel_flags) & SUPPRESS_JOIN_NOTIFICATIONS;
 
-  q.updateGuild.run(name, icon, guild.id);
-  const update = { id: guild.id, name, icon, owner_id: guild.owner_id };
+  q.updateGuild.run(next.name, next.icon, next.banner, next.system_channel_id, next.system_channel_flags, guild.id);
+  const changes = diff(
+    { ...guild, icon_hash: imageHash(guild.icon), banner_hash: imageHash(guild.banner) },
+    { ...next, icon_hash: imageHash(next.icon), banner_hash: imageHash(next.banner) },
+    ['name', 'icon_hash', 'banner_hash', 'system_channel_id', 'system_channel_flags'],
+  );
+  if (changes.length) audit(guild.id, req.user.id, AUDIT.GUILD_UPDATE, { target: guild.id, changes });
+  const update = guildFields(q.guild.get(guild.id));
   dispatchToGuild(guild.id, 'GUILD_UPDATE', update);
   res.json(update);
 });
@@ -419,6 +545,7 @@ api.delete('/guilds/:guildId', (req, res) => {
   const memberIds = q.memberIds.all(guild.id).map((m) => m.user_id);
   disconnectVoice((v) => v.guild_id === guild.id);
   q.deleteGuild.run(guild.id);
+  for (const id of memberIds) forgetGuild(id, guild.id);
   dispatchToUsers(memberIds, 'GUILD_DELETE', { id: guild.id });
   res.status(204).end();
 });
@@ -427,6 +554,7 @@ function removeMember(guild, userId) {
   disconnectVoice((v) => v.guild_id === guild.id && v.user_id === userId);
   const user = q.userById.get(userId);
   q.deleteMember.run(guild.id, userId);
+  forgetGuild(userId, guild.id);
   dispatchToGuild(guild.id, 'GUILD_MEMBER_REMOVE', { guild_id: guild.id, user: publicUser(user) });
   dispatchToUser(userId, 'GUILD_DELETE', { id: guild.id });
 }
@@ -438,19 +566,21 @@ api.delete('/users/@me/guilds/:guildId', (req, res) => {
   res.status(204).end();
 });
 
+// Ordem dos servidores na barra lateral (guild_positions das configurações do Discord).
+api.patch('/users/@me/settings', (req, res) => {
+  const positions = req.body?.guild_positions;
+  if (!Array.isArray(positions) || positions.length > 200) fail(400, 'Formato inválido.');
+  const mine = new Set(q.guildsOf.all(req.user.id).map((g) => g.id));
+  const list = [...new Set(positions.map(String))].filter((id) => mine.has(id));
+  q.setGuildPositions.run(JSON.stringify(list), req.user.id);
+  dispatchToUser(req.user.id, 'USER_SETTINGS_UPDATE', { guild_positions: list });
+  res.json({ guild_positions: list });
+});
+
 // --- canais ---
 
-api.post('/guilds/:guildId/channels', (req, res) => {
-  const { guild } = loadGuild(req, P.MANAGE_CHANNELS);
-  const type = req.body?.type === CHANNEL_VOICE ? CHANNEL_VOICE : CHANNEL_TEXT;
-  const name = channelName(req.body?.name, type);
-
-  const id = snowflake();
-  q.insertChannel.run(id, guild.id, name, type, q.nextChannelPosition.get(guild.id).pos);
-  const channel = q.channel.get(id);
-  dispatchToGuild(guild.id, 'CHANNEL_CREATE', channel);
-  res.status(201).json(channel);
-});
+const SLOWMODE_MAX = 21600; // 6 horas, como no Discord
+const CHANNEL_AUDIT_KEYS = ['name', 'type', 'topic', 'nsfw', 'rate_limit_per_user', 'parent_id'];
 
 function channelName(raw, type) {
   let name = String(raw ?? '').trim();
@@ -459,12 +589,152 @@ function channelName(raw, type) {
   return name;
 }
 
-function loadManagedChannel(req) {
+function slowmode(raw) {
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0 || value > SLOWMODE_MAX) fail(400, 'Modo lento: de 0 a 21600 segundos.');
+  return value;
+}
+
+const auditChannel = (c) => ({ ...c, nsfw: !!c.nsfw, parent_id: c.parent_id ?? null });
+
+// Lista de overwrites vinda do cliente: cargos e membros do servidor, só com bits de canal.
+function parseOverwrites(raw, guild) {
+  if (!Array.isArray(raw) || raw.length > 100) fail(400, 'Overwrites de permissão inválidos.');
+  const seen = new Set();
+  return raw.map((o) => {
+    const id = String(o?.id ?? '');
+    const type = Number(o?.type);
+    if (seen.has(id)) fail(400, 'Overwrite repetido.');
+    seen.add(id);
+    if (type === OVERWRITE_ROLE ? q.role.get(id)?.guild_id !== guild.id : type !== OVERWRITE_MEMBER || !q.member.get(guild.id, id)) {
+      fail(400, 'Cargo ou membro inválido nos overwrites.');
+    }
+    const allow = Number(o.allow ?? 0) & CHANNEL_PERMISSIONS;
+    const deny = Number(o.deny ?? 0) & CHANNEL_PERMISSIONS & ~allow;
+    return { id, type, allow, deny };
+  });
+}
+
+const sameOverwrites = (a, b) => {
+  const key = (list) => JSON.stringify([...list].sort((x, y) => (x.id < y.id ? -1 : 1)).map((o) => [o.id, o.type, o.allow, o.deny]));
+  return key(a) === key(b);
+};
+
+const overwritesOf = (channelId) => q.overwritesOf.all(channelId).map(toOverwrite);
+
+// Quem não é administrador só libera ou nega por canal o que ele mesmo tem no canal.
+function checkOverwriteGrant(perms, before, after) {
+  if (has(perms, P.ADMINISTRATOR)) return;
+  let changed = 0;
+  for (const o of [...before, ...after]) {
+    const a = before.find((x) => x.id === o.id) ?? { allow: 0, deny: 0 };
+    const b = after.find((x) => x.id === o.id) ?? { allow: 0, deny: 0 };
+    changed |= (a.allow ^ b.allow) | (a.deny ^ b.deny);
+  }
+  if (changed & ~perms) fail(403, 'Você não pode alterar permissões que não possui neste canal.');
+}
+
+function writeOverwrites(channelId, list) {
+  q.clearOverwrites.run(channelId);
+  for (const o of list) q.insertOverwrite.run(channelId, o.id, o.type, o.allow, o.deny);
+}
+
+// Uma entrada por overwrite criado, alterado ou removido.
+function auditOverwrites(guild, userId, channelId, before, after) {
+  const roleName = (o) => (o.type === OVERWRITE_ROLE ? { role_name: q.role.get(o.id)?.name } : {});
+  for (const o of after) {
+    const old = before.find((x) => x.id === o.id);
+    const options = { id: o.id, type: String(o.type), ...roleName(o) };
+    if (!old) {
+      audit(guild.id, userId, AUDIT.CHANNEL_OVERWRITE_CREATE, { target: channelId, options, changes: diff({}, o, ['id', 'type', 'allow', 'deny']) });
+    } else if (old.allow !== o.allow || old.deny !== o.deny) {
+      audit(guild.id, userId, AUDIT.CHANNEL_OVERWRITE_UPDATE, { target: channelId, options, changes: diff(old, o, ['allow', 'deny']) });
+    }
+  }
+  for (const o of before) {
+    if (after.some((x) => x.id === o.id)) continue;
+    audit(guild.id, userId, AUDIT.CHANNEL_OVERWRITE_DELETE, {
+      target: channelId, options: { id: o.id, type: String(o.type), ...roleName(o) }, changes: diff(o, {}, ['id', 'type', 'allow', 'deny']),
+    });
+  }
+}
+
+api.post('/guilds/:guildId/channels', (req, res) => {
+  const { guild, perms } = loadGuild(req, P.MANAGE_CHANNELS);
+  const body = req.body ?? {};
+  const type = [CHANNEL_VOICE, CHANNEL_CATEGORY].includes(body.type) ? body.type : CHANNEL_TEXT;
+  const name = channelName(body.name, type);
+
+  let parentId = null;
+  if (body.parent_id && type !== CHANNEL_CATEGORY) {
+    const parent = q.channel.get(String(body.parent_id));
+    if (!parent || parent.guild_id !== guild.id || parent.type !== CHANNEL_CATEGORY) fail(400, 'Categoria inválida.');
+    parentId = parent.id;
+  }
+  // Sem overwrites próprios, o canal nasce sincronizado com a categoria.
+  const inherited = parentId ? overwritesOf(parentId) : [];
+  let overwrites = inherited;
+  if (body.permission_overwrites !== undefined) {
+    if (!has(perms, P.MANAGE_ROLES)) fail(403, 'Você precisa da permissão Gerenciar cargos para criar canais privados.');
+    overwrites = parseOverwrites(body.permission_overwrites, guild);
+    checkOverwriteGrant(perms, inherited, overwrites);
+  }
+
+  const id = snowflake();
+  db.transaction(() => {
+    q.insertChannel.run(id, guild.id, name, type, q.nextChannelPosition.get(guild.id).pos, parentId);
+    if (type !== CHANNEL_CATEGORY) {
+      q.updateGuildChannel.run(name, type === CHANNEL_TEXT ? String(body.topic ?? '').slice(0, 1024) : '', body.nsfw ? 1 : 0,
+        type === CHANNEL_TEXT && body.rate_limit_per_user !== undefined ? slowmode(body.rate_limit_per_user) : 0, id);
+    }
+    writeOverwrites(id, overwrites);
+  })();
+  const created = q.channel.get(id);
+  const createdChanges = diff({}, auditChannel(created), ['name', 'type', 'nsfw', 'rate_limit_per_user']).filter((c) => c.key === 'type' || c.new_value);
+  audit(guild.id, req.user.id, AUDIT.CHANNEL_CREATE, { target: id, changes: createdChanges });
+  syncChannels(guild.id, [id]);
+  res.status(201).json(toChannel(created));
+});
+
+// Reordenar arrastando: [{ id, position, parent_id?, lock_permissions? }], como no Discord.
+api.patch('/guilds/:guildId/channels', (req, res) => {
+  const { guild } = loadGuild(req, P.MANAGE_CHANNELS);
+  const moves = Array.isArray(req.body) ? req.body : fail(400, 'Formato inválido.');
+  const channels = new Map(q.channelsOf.all(guild.id).map((c) => [c.id, c]));
+  const plan = moves.map((m) => {
+    const channel = channels.get(String(m?.id));
+    if (!channel) fail(400, 'Canal inválido.');
+    if (!Number.isInteger(m.position) || m.position < 0) fail(400, 'Posição inválida.');
+    let parentId = channel.parent_id;
+    if (m.parent_id !== undefined) {
+      parentId = m.parent_id === null ? null : String(m.parent_id);
+      if (parentId && (channel.type === CHANNEL_CATEGORY || channels.get(parentId)?.type !== CHANNEL_CATEGORY)) fail(400, 'Categoria inválida.');
+    }
+    return { channel, position: m.position, parentId, lock: !!m.lock_permissions };
+  });
+
+  db.transaction(() => {
+    for (const { channel, position, parentId, lock } of plan) {
+      q.moveChannel.run(position, parentId, channel.id);
+      if (lock && parentId) writeOverwrites(channel.id, overwritesOf(parentId));
+    }
+  })();
+  for (const { channel, parentId } of plan) {
+    if ((channel.parent_id ?? null) !== parentId) {
+      audit(guild.id, req.user.id, AUDIT.CHANNEL_UPDATE, { target: channel.id, changes: diff(channel, { parent_id: parentId }, ['parent_id']) });
+    }
+  }
+  syncChannels(guild.id, plan.map((p) => p.channel.id));
+  res.status(204).end();
+});
+
+// Canal de servidor que o usuário vê, com as permissões dele no canal.
+function loadGuildChannel(req) {
   const channel = loadChannel(req);
   if (!channel.guild_id) fail(400, 'Não é possível editar uma mensagem direta.');
   req.params.guildId = channel.guild_id;
-  loadGuild(req, P.MANAGE_CHANNELS);
-  return channel;
+  const { guild } = loadGuild(req);
+  return { channel, guild, perms: channelPermissionsOf(channel, req.user.id) };
 }
 
 api.patch('/channels/:channelId', (req, res) => {
@@ -478,15 +748,43 @@ api.patch('/channels/:channelId', (req, res) => {
     postMessage(q.channel.get(group.id), req.user, { type: MSG.CHANNEL_NAME_CHANGE, content: name, meta: { name } });
     return res.json(buildDmChannel(q.channel.get(group.id), req.user.id));
   }
-  const channel = loadManagedChannel(req);
-  const name = req.body?.name === undefined ? channel.name : channelName(req.body.name, channel.type);
-  const topic = req.body?.topic === undefined ? channel.topic : String(req.body.topic ?? '');
-  if (topic.length > 1024) fail(400, 'O tópico pode ter no máximo 1024 caracteres.');
+  const { channel, guild, perms } = loadGuildChannel(req);
+  const body = req.body ?? {};
+  const { permission_overwrites: rawOverwrites, ...fields } = body;
+  // Editar o canal exige Gerenciar canais; os overwrites, Gerenciar permissões (MANAGE_ROLES no canal).
+  if (Object.keys(fields).length && !has(perms, P.MANAGE_CHANNELS)) fail(403, 'Você não tem permissão para fazer isso.');
+  if (rawOverwrites !== undefined && !has(perms, P.MANAGE_ROLES)) fail(403, 'Você não tem permissão para alterar as permissões deste canal.');
 
-  q.updateChannel.run(name, topic, channel.id);
-  const updated = q.channel.get(channel.id);
-  dispatchToGuild(channel.guild_id, 'CHANNEL_UPDATE', updated);
-  res.json(updated);
+  const isText = channel.type === CHANNEL_TEXT;
+  const next = {
+    ...channel,
+    name: fields.name === undefined ? channel.name : channelName(fields.name, channel.type),
+    topic: isText && fields.topic !== undefined ? String(fields.topic ?? '') : channel.topic,
+    nsfw: channel.type !== CHANNEL_CATEGORY && fields.nsfw !== undefined ? (fields.nsfw ? 1 : 0) : channel.nsfw,
+    rate_limit_per_user: isText && fields.rate_limit_per_user !== undefined ? slowmode(fields.rate_limit_per_user) : channel.rate_limit_per_user,
+  };
+  if (next.topic.length > 1024) fail(400, 'O tópico pode ter no máximo 1024 caracteres.');
+
+  const before = overwritesOf(channel.id);
+  const after = rawOverwrites === undefined ? before : parseOverwrites(rawOverwrites, guild);
+  checkOverwriteGrant(perms, before, after);
+  // Editar a categoria leva junto os canais que estavam sincronizados com ela.
+  const synced = channel.type === CHANNEL_CATEGORY && rawOverwrites !== undefined
+    ? q.channelsOf.all(guild.id).filter((c) => c.parent_id === channel.id && sameOverwrites(overwritesOf(c.id), before))
+    : [];
+
+  db.transaction(() => {
+    q.updateGuildChannel.run(next.name, next.topic, next.nsfw, next.rate_limit_per_user, channel.id);
+    if (rawOverwrites !== undefined) {
+      writeOverwrites(channel.id, after);
+      for (const c of synced) writeOverwrites(c.id, after);
+    }
+  })();
+  const changes = diff(auditChannel(channel), auditChannel(next), CHANNEL_AUDIT_KEYS);
+  if (changes.length) audit(guild.id, req.user.id, AUDIT.CHANNEL_UPDATE, { target: channel.id, changes });
+  if (rawOverwrites !== undefined) auditOverwrites(guild, req.user.id, channel.id, before, after);
+  syncChannels(guild.id, [channel.id, ...synced.map((c) => c.id)]);
+  res.json(toChannel(q.channel.get(channel.id)));
 });
 
 api.delete('/channels/:channelId', (req, res) => {
@@ -494,10 +792,19 @@ api.delete('/channels/:channelId', (req, res) => {
     removeFromGroup(loadGroup(req), req.user, req.user.id);
     return res.status(204).end();
   }
-  const channel = loadManagedChannel(req);
+  const { channel, guild, perms } = loadGuildChannel(req);
+  if (!has(perms, P.MANAGE_CHANNELS)) fail(403, 'Você não tem permissão para fazer isso.');
+  // Excluir uma categoria não exclui os canais: eles ficam sem categoria.
+  const children = q.channelsOf.all(guild.id).filter((c) => c.parent_id === channel.id).map((c) => c.id);
   disconnectVoice((v) => v.channel_id === channel.id);
-  q.deleteChannel.run(channel.id);
-  dispatchToGuild(channel.guild_id, 'CHANNEL_DELETE', { id: channel.id, guild_id: channel.guild_id });
+  db.transaction(() => {
+    q.orphanChildren.run(channel.id);
+    q.clearSystemChannel.run(channel.id);
+    q.deleteChannel.run(channel.id);
+  })();
+  if (guild.system_channel_id === channel.id) dispatchToGuild(guild.id, 'GUILD_UPDATE', guildFields(q.guild.get(guild.id)));
+  audit(guild.id, req.user.id, AUDIT.CHANNEL_DELETE, { target: channel.id, changes: diff(auditChannel(channel), {}, ['name', 'type', 'nsfw']) });
+  syncChannels(guild.id, children);
   res.status(204).end();
 });
 
@@ -527,6 +834,9 @@ function checkGrantable(perms, before, after) {
   if ((after & ~before) & ~perms) fail(403, 'Você não pode conceder permissões que não possui.');
 }
 
+const ROLE_AUDIT_KEYS = ['name', 'color', 'permissions', 'hoist'];
+const auditRole = (r) => ({ ...r, hoist: !!r.hoist });
+
 api.post('/guilds/:guildId/roles', (req, res) => {
   const { guild, perms } = loadGuild(req, P.MANAGE_ROLES);
   const permissions = Number(req.body?.permissions ?? 0) & ALL_PERMISSIONS;
@@ -538,8 +848,10 @@ api.post('/guilds/:guildId/roles', (req, res) => {
     q.shiftRolesUp.run(guild.id, 1);
     q.insertRole.run(id, guild.id, name, null, permissions, 1, 0);
   })();
+  const role = q.role.get(id);
+  audit(guild.id, req.user.id, AUDIT.ROLE_CREATE, { target: id, changes: diff({}, auditRole(role), ROLE_AUDIT_KEYS).filter((c) => c.new_value) });
   broadcastRoles(guild.id);
-  res.status(201).json(toRole(q.role.get(id)));
+  res.status(201).json(toRole(role));
 });
 
 api.patch('/guilds/:guildId/roles/:roleId', (req, res) => {
@@ -556,8 +868,12 @@ api.patch('/guilds/:guildId/roles/:roleId', (req, res) => {
   const hoist = body.hoist === undefined ? role.hoist : body.hoist ? 1 : 0;
 
   q.updateRole.run(name, color, permissions, role.id === guild.id ? 0 : hoist, role.id);
+  const updated = q.role.get(role.id);
+  const changes = diff(auditRole(role), auditRole(updated), ROLE_AUDIT_KEYS);
+  if (changes.length) audit(guild.id, req.user.id, AUDIT.ROLE_UPDATE, { target: role.id, changes });
   broadcastRoles(guild.id);
-  res.json(toRole(q.role.get(role.id)));
+  if (updated.permissions !== role.permissions) syncChannels(guild.id);
+  res.json(toRole(updated));
 });
 
 // Corpo: [{ id, position }] para os cargos movidos (as demais posições se ajustam).
@@ -587,24 +903,29 @@ api.delete('/guilds/:guildId/roles/:roleId', (req, res) => {
   if (role.id === guild.id) fail(400, 'O cargo @everyone não pode ser excluído.');
 
   const holders = q.usersWithRole.all(role.id).map((r) => r.user_id);
+  const channelsWithOverwrite = q.guildOverwrites.all(guild.id).filter((o) => o.target_id === role.id).map((o) => o.channel_id);
   db.transaction(() => {
     q.deleteRole.run(role.id);
+    q.deleteOverwritesFor.run(role.id, guild.id);
     normalizeRolePositions(guild.id);
   })();
+  audit(guild.id, req.user.id, AUDIT.ROLE_DELETE, { target: role.id, changes: diff(auditRole(role), {}, ROLE_AUDIT_KEYS) });
   broadcastRoles(guild.id);
   for (const userId of holders) dispatchMemberUpdate(guild.id, userId);
+  syncChannels(guild.id, channelsWithOverwrite);
   res.status(204).end();
 });
 
-// --- membros, expulsões e banimentos ---
+// --- membros, apelidos, expulsões e banimentos ---
 
 function dispatchMemberUpdate(guildId, userId) {
   dispatchToGuild(guildId, 'GUILD_MEMBER_UPDATE', { guild_id: guildId, ...buildMember(guildId, q.userById.get(userId)) });
 }
 
 function loadTargetMember(req, guild) {
-  if (!q.member.get(guild.id, req.params.userId)) fail(404, 'Membro não encontrado.');
-  return req.params.userId;
+  const userId = req.params.userId === '@me' ? req.user.id : req.params.userId;
+  if (!q.member.get(guild.id, userId)) fail(404, 'Membro não encontrado.');
+  return userId;
 }
 
 // Expulsar/banir exige estar acima do alvo na hierarquia; o dono nunca é alvo.
@@ -615,28 +936,61 @@ function checkOutranks(req, guild, targetId) {
   }
 }
 
+// Apelido (nick) e cargos. O próprio apelido exige Alterar apelido; o dos outros, Gerenciar apelidos
+// e estar acima na hierarquia. /members/@me altera o próprio, como no Discord.
 api.patch('/guilds/:guildId/members/:userId', (req, res) => {
-  const { guild } = loadGuild(req, P.MANAGE_ROLES);
+  const { guild, perms } = loadGuild(req);
   const userId = loadTargetMember(req, guild);
-  const wanted = Array.isArray(req.body?.roles) ? [...new Set(req.body.roles.map(String))] : fail(400, 'Informe os cargos.');
+  const body = req.body ?? {};
+  if (body.nick === undefined && body.roles === undefined) fail(400, 'Nada para alterar.');
 
-  const roles = q.roles.all(guild.id);
-  const current = q.memberRoles.all(guild.id, userId).map((r) => r.role_id);
-  const rank = rankOf(guild, req.user.id);
-  const changed = [...wanted.filter((id) => !current.includes(id)), ...current.filter((id) => !wanted.includes(id))];
-  for (const id of changed) {
-    const role = roles.find((r) => r.id === id);
-    if (!role || role.id === guild.id) fail(400, 'Cargo inválido.');
-    if (role.position >= rank) fail(403, 'Você só pode atribuir cargos abaixo do seu cargo mais alto.');
+  let nick;
+  if (body.nick !== undefined) {
+    if (userId === req.user.id) {
+      if (!has(perms, P.CHANGE_NICKNAME) && !has(perms, P.MANAGE_NICKNAMES)) fail(403, 'Você não tem permissão para alterar seu apelido.');
+    } else {
+      if (!has(perms, P.MANAGE_NICKNAMES)) fail(403, 'Você não tem permissão para alterar apelidos.');
+      checkOutranks(req, guild, userId);
+    }
+    nick = String(body.nick ?? '').trim();
+    if (nick.length > 32) fail(400, 'O apelido pode ter no máximo 32 caracteres.');
+    nick ||= null;
   }
 
-  db.transaction(() => {
-    for (const id of changed) {
-      if (wanted.includes(id)) q.addMemberRole.run(guild.id, userId, id);
-      else q.removeMemberRole.run(guild.id, userId, id);
+  let added = [];
+  let removed = [];
+  if (body.roles !== undefined) {
+    if (!has(perms, P.MANAGE_ROLES)) fail(403, 'Você não tem permissão para fazer isso.');
+    const wanted = Array.isArray(body.roles) ? [...new Set(body.roles.map(String))] : fail(400, 'Informe os cargos.');
+    const roles = q.roles.all(guild.id);
+    const current = q.memberRoles.all(guild.id, userId).map((r) => r.role_id);
+    const rank = rankOf(guild, req.user.id);
+    added = wanted.filter((id) => !current.includes(id));
+    removed = current.filter((id) => !wanted.includes(id));
+    for (const id of [...added, ...removed]) {
+      const role = roles.find((r) => r.id === id);
+      if (!role || role.id === guild.id) fail(400, 'Cargo inválido.');
+      if (role.position >= rank) fail(403, 'Você só pode atribuir cargos abaixo do seu cargo mais alto.');
     }
+  }
+
+  const before = q.member.get(guild.id, userId);
+  db.transaction(() => {
+    if (nick !== undefined) q.setNick.run(nick, guild.id, userId);
+    for (const id of added) q.addMemberRole.run(guild.id, userId, id);
+    for (const id of removed) q.removeMemberRole.run(guild.id, userId, id);
   })();
+
+  if (nick !== undefined && nick !== (before.nick ?? null)) {
+    audit(guild.id, req.user.id, AUDIT.MEMBER_UPDATE, { target: userId, changes: diff(before, { nick }, ['nick']) });
+  }
+  if (added.length || removed.length) {
+    const named = (ids) => ids.map((id) => ({ id, name: q.role.get(id).name }));
+    const changes = [added.length && { key: '$add', new_value: named(added) }, removed.length && { key: '$remove', new_value: named(removed) }].filter(Boolean);
+    audit(guild.id, req.user.id, AUDIT.MEMBER_ROLE_UPDATE, { target: userId, changes });
+  }
   dispatchMemberUpdate(guild.id, userId);
+  if (added.length || removed.length) syncChannels(guild.id);
   res.json(buildMember(guild.id, q.userById.get(userId)));
 });
 
@@ -645,6 +999,7 @@ api.delete('/guilds/:guildId/members/:userId', (req, res) => {
   const userId = loadTargetMember(req, guild);
   checkOutranks(req, guild, userId);
   removeMember(guild, userId);
+  audit(guild.id, req.user.id, AUDIT.MEMBER_KICK, { target: userId, reason: String(req.body?.reason ?? '').slice(0, 512) });
   res.status(204).end();
 });
 
@@ -659,8 +1014,10 @@ api.put('/guilds/:guildId/bans/:userId', (req, res) => {
   if (!target) fail(404, 'Usuário não encontrado.');
   checkOutranks(req, guild, target.id);
 
-  q.insertBan.run(guild.id, target.id, String(req.body?.reason ?? '').slice(0, 512), now());
+  const reason = String(req.body?.reason ?? '').slice(0, 512);
+  q.insertBan.run(guild.id, target.id, reason, now());
   if (q.member.get(guild.id, target.id)) removeMember(guild, target.id);
+  audit(guild.id, req.user.id, AUDIT.MEMBER_BAN_ADD, { target: target.id, reason });
   res.status(204).end();
 });
 
@@ -668,6 +1025,7 @@ api.delete('/guilds/:guildId/bans/:userId', (req, res) => {
   const { guild } = loadGuild(req, P.BAN_MEMBERS);
   if (!q.ban.get(guild.id, req.params.userId)) fail(404, 'Banimento não encontrado.');
   q.deleteBan.run(guild.id, req.params.userId);
+  audit(guild.id, req.user.id, AUDIT.MEMBER_BAN_REMOVE, { target: req.params.userId });
   res.status(204).end();
 });
 
@@ -677,6 +1035,7 @@ api.post('/guilds/:guildId/invites', (req, res) => {
   const { guild } = loadGuild(req, P.CREATE_INSTANT_INVITE);
   const code = randomBytes(6).toString('base64url');
   q.insertInvite.run(code, guild.id, req.user.id, now());
+  audit(guild.id, req.user.id, AUDIT.INVITE_CREATE, { changes: [{ key: 'code', new_value: code }] });
   res.status(201).json({ code, guild_id: guild.id });
 });
 
@@ -694,6 +1053,7 @@ api.delete('/invites/:code', (req, res) => {
   const { perms } = loadGuild(req);
   if (invite.creator_id !== req.user.id && !has(perms, P.MANAGE_GUILD)) fail(403, 'Você não tem permissão para fazer isso.');
   q.deleteInvite.run(invite.code);
+  audit(invite.guild_id, req.user.id, AUDIT.INVITE_DELETE, { changes: [{ key: 'code', old_value: invite.code }] });
   res.status(204).end();
 });
 
@@ -704,31 +1064,36 @@ api.post('/invites/:code', (req, res) => {
   if (!invite) fail(404, 'O convite é inválido ou expirou.');
   if (q.ban.get(invite.guild_id, req.user.id)) fail(403, 'Você está banido deste servidor.');
 
-  if (!q.member.get(invite.guild_id, req.user.id)) {
+  const joined = !q.member.get(invite.guild_id, req.user.id);
+  if (joined) {
     const joined_at = now();
     q.insertMember.run(invite.guild_id, req.user.id, joined_at);
     q.useInvite.run(invite.code);
     dispatchToGuild(invite.guild_id, 'GUILD_MEMBER_ADD', {
       guild_id: invite.guild_id,
       user: publicUser(req.user),
+      nick: null,
       roles: [],
       joined_at,
       status: statusOf(req.user.id),
     });
     broadcastPresence(req.user.id);
   }
-  const guild = buildGuild(q.guild.get(invite.guild_id));
-  dispatchToUser(req.user.id, 'GUILD_CREATE', guild);
+  const guild = sendGuild(req.user.id, invite.guild_id);
+  // Mensagem de boas-vindas no canal de mensagens do sistema (tipo 7 do Discord).
+  const row = q.guild.get(invite.guild_id);
+  const systemChannel = row.system_channel_id && q.channel.get(row.system_channel_id);
+  if (joined && systemChannel && !(row.system_channel_flags & SUPPRESS_JOIN_NOTIFICATIONS)) {
+    postMessage(systemChannel, req.user, { type: MSG.USER_JOIN });
+  }
   res.json(guild);
 });
 
 // --- digitando ---
 
-function canSendIn(req, channel) {
-  if (!channel.guild_id) return true;
-  req.params.guildId = channel.guild_id;
-  return has(loadGuild(req).perms, P.SEND_MESSAGES);
-}
+// Permissão no canal (DMs e grupos: tudo liberado para os participantes).
+const can = (req, channel, flag) => !channel.guild_id || has(channelPermissionsOf(channel, req.user.id), flag);
+const canSendIn = (req, channel) => can(req, channel, P.SEND_MESSAGES);
 
 function isBlockedDm(req, channel) {
   if (channel.type !== CHANNEL_DM) return false;
@@ -769,6 +1134,7 @@ for (const a of q.staleUploads.all(new Date(Date.now() - 86_400_000).toISOString
 api.post('/channels/:channelId/attachments', (req, res) => {
   const channel = loadMessageChannel(req);
   if (!canSendIn(req, channel)) fail(403, 'Você não tem permissão para enviar mensagens neste canal.');
+  if (!can(req, channel, P.ATTACH_FILES)) fail(403, 'Você não tem permissão para enviar arquivos neste canal.');
   const files = Array.isArray(req.body?.files) ? req.body.files : [];
   if (!files.length) fail(400, 'Nenhum arquivo.');
   if (files.length > MAX_ATTACHMENTS) fail(400, `Você só pode enviar até ${MAX_ATTACHMENTS} arquivos de uma vez.`);
@@ -830,10 +1196,12 @@ api.get('/channels/:channelId/messages', (req, res) => {
 });
 
 // Grava e distribui uma mensagem (normal, resposta ou de sistema) no canal.
-function postMessage(channel, author, { content = '', type = MSG.DEFAULT, reference_id = null, reply_ping = false, meta = null, attachments = [] }) {
+function postMessage(channel, author, {
+  content = '', type = MSG.DEFAULT, reference_id = null, reply_ping = false, meta = null, attachments = [], mention_everyone = false,
+}) {
   const id = snowflake();
   db.transaction(() => {
-    q.insertMessage.run(id, channel.id, author.id, content, type, reference_id, reply_ping ? 1 : 0, meta && JSON.stringify(meta));
+    q.insertMessage.run(id, channel.id, author.id, content, type, reference_id, reply_ping ? 1 : 0, meta && JSON.stringify(meta), mention_everyone ? 1 : 0);
     for (const a of attachments) q.linkAttachment.run(id, a.filename, a.width, a.height, a.position, a.row.id);
     q.touchChannel.run(id, channel.id);
   })();
@@ -846,11 +1214,22 @@ function postMessage(channel, author, { content = '', type = MSG.DEFAULT, refere
 }
 
 // Em servidor, fixar exige Gerenciar mensagens; em DM e grupo, qualquer participante pode.
-function canManageMessages(req, channel) {
-  if (!channel.guild_id) return true;
-  req.params.guildId = channel.guild_id;
-  return has(loadGuild(req).perms, P.MANAGE_MESSAGES);
+const canManageMessages = (req, channel) => can(req, channel, P.MANAGE_MESSAGES);
+
+// Modo lento: último envio de cada membro por canal. Quem gerencia mensagens ou o canal não espera.
+const lastSent = new Map(); // `${canal}:${usuário}` -> instante (ms)
+
+function checkSlowmode(req, channel) {
+  if (!channel.rate_limit_per_user) return;
+  const perms = channelPermissionsOf(channel, req.user.id);
+  if (has(perms, P.MANAGE_MESSAGES) || has(perms, P.MANAGE_CHANNELS)) return;
+  const key = `${channel.id}:${req.user.id}`;
+  const wait = (lastSent.get(key) ?? 0) + channel.rate_limit_per_user * 1000 - Date.now();
+  if (wait > 0) fail(429, 'Calma! O modo lento está ativado neste canal.', { retry_after: Math.ceil(wait / 1000), code: 20016 });
+  lastSent.set(key, Date.now());
 }
+
+const EVERYONE = /(^|[^\w.])@(everyone|here)(?![\w.])/i;
 
 function loadMessage(req, channel) {
   const message = q.message.get(req.params.messageId);
@@ -871,6 +1250,7 @@ api.post('/channels/:channelId/messages', (req, res) => {
   if (isBlockedDm(req, channel)) fail(403, 'Sua mensagem não pôde ser entregue. Isso acontece quando um dos dois bloqueou o outro.');
   const attachments = claimAttachments(req, channel);
   if (content.length > 2000 || (!content && !attachments.length)) fail(400, 'A mensagem precisa ter de 1 a 2000 caracteres.');
+  checkSlowmode(req, channel);
 
   // Resposta: message_reference + allowed_mentions.replied_user (menciona o autor), como no Discord.
   let reference = null;
@@ -885,6 +1265,8 @@ api.post('/channels/:channelId/messages', (req, res) => {
     reference_id: reference?.id ?? null,
     reply_ping: reference ? req.body?.allowed_mentions?.replied_user !== false : false,
     attachments,
+    // @everyone/@here só notificam se o autor tem a permissão no canal.
+    mention_everyone: !!channel.guild_id && EVERYONE.test(content) && can(req, channel, P.MENTION_EVERYONE),
   });
   res.status(201).json(message);
 });
@@ -914,6 +1296,9 @@ api.delete('/channels/:channelId/messages/:messageId', (req, res) => {
   const files = q.attachmentsOfMessage.all(message.id);
   q.deleteMessage.run(message.id);
   for (const a of files) removeUpload(a);
+  if (channel.guild_id && message.author_id !== req.user.id) {
+    audit(channel.guild_id, req.user.id, AUDIT.MESSAGE_DELETE, { target: message.author_id, options: { channel_id: channel.id, count: '1' } });
+  }
   dispatchToChannel(channel, 'MESSAGE_DELETE', { id: message.id, channel_id: channel.id, guild_id: channel.guild_id });
   if (message.pinned_at) dispatchPinsUpdate(channel);
   res.status(204).end();
@@ -944,6 +1329,9 @@ api.put('/channels/:channelId/pins/:messageId', (req, res) => {
   if (q.pinCount.get(channel.id).n >= MAX_PINS) fail(400, `Você atingiu o limite de ${MAX_PINS} mensagens fixadas neste canal.`);
 
   q.setPinned.run(new Date().toISOString(), message.id);
+  if (channel.guild_id) {
+    audit(channel.guild_id, req.user.id, AUDIT.MESSAGE_PIN, { target: message.author_id, options: { channel_id: channel.id, message_id: message.id } });
+  }
   dispatchMessageUpdate(channel, message.id);
   dispatchPinsUpdate(channel);
   postMessage(channel, req.user, { type: MSG.CHANNEL_PINNED_MESSAGE, reference_id: message.id });
@@ -957,6 +1345,9 @@ api.delete('/channels/:channelId/pins/:messageId', (req, res) => {
   if (!message.pinned_at) return res.status(204).end();
 
   q.setPinned.run(null, message.id);
+  if (channel.guild_id) {
+    audit(channel.guild_id, req.user.id, AUDIT.MESSAGE_UNPIN, { target: message.author_id, options: { channel_id: channel.id, message_id: message.id } });
+  }
   dispatchMessageUpdate(channel, message.id);
   dispatchPinsUpdate(channel);
   res.status(204).end();
@@ -975,6 +1366,8 @@ function loadReaction(req) {
 api.put('/channels/:channelId/messages/:messageId/reactions/:emoji/@me', (req, res) => {
   const { channel, message, emoji } = loadReaction(req);
   const known = loadMessages([q.messageWithAuthor.get(message.id)])[0].reactions;
+  // Sem "Adicionar reações" ainda dá para somar-se a uma reação que já existe, como no Discord.
+  if (!known.some((r) => r.emoji === emoji) && !can(req, channel, P.ADD_REACTIONS)) fail(403, 'Você não tem permissão para adicionar reações.');
   if (!known.some((r) => r.emoji === emoji) && known.length >= MAX_REACTION_KINDS) {
     fail(400, `Uma mensagem pode ter no máximo ${MAX_REACTION_KINDS} reações diferentes.`);
   }
@@ -996,6 +1389,6 @@ api.delete('/channels/:channelId/messages/:messageId/reactions/:emoji/@me', (req
 
 // Erros lançados com fail() viram respostas JSON; o resto segue para o handler geral.
 api.use((err, _req, res, next) => {
-  if (err instanceof HttpError) return res.status(err.status).json({ message: err.message });
+  if (err instanceof HttpError) return res.status(err.status).json({ message: err.message, ...err.extra });
   next(err);
 });

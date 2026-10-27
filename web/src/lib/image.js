@@ -1,6 +1,6 @@
-// Redimensiona a imagem escolhida para um quadrado e devolve um data URL pequeno
-// (avatar e ícone de servidor ficam no banco como data URL).
-export function pickImage(size = 256) {
+// Recorta a imagem escolhida no centro, na proporção pedida, e devolve um data URL pequeno
+// (avatar, ícone e banner de servidor ficam no banco como data URL).
+export function pickImage(width = 256, height = width) {
   return new Promise((resolve, reject) => {
     const input = document.createElement('input');
     input.type = 'file';
@@ -12,9 +12,12 @@ export function pickImage(size = 256) {
       const img = new Image();
       img.onload = () => {
         const canvas = document.createElement('canvas');
-        canvas.width = canvas.height = size;
-        const side = Math.min(img.width, img.height);
-        canvas.getContext('2d').drawImage(img, (img.width - side) / 2, (img.height - side) / 2, side, side, 0, 0, size, size);
+        canvas.width = width;
+        canvas.height = height;
+        const scale = Math.min(img.width / width, img.height / height);
+        const sw = width * scale;
+        const sh = height * scale;
+        canvas.getContext('2d').drawImage(img, (img.width - sw) / 2, (img.height - sh) / 2, sw, sh, 0, 0, width, height);
         URL.revokeObjectURL(url);
         resolve(canvas.toDataURL('image/webp', 0.85));
       };

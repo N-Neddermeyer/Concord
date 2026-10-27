@@ -102,8 +102,9 @@ function renderInline(type, m, ctx, key) {
     case 'mention': {
       const user = ctx.usersByName?.get(m[1].toLowerCase());
       if (!user) return undefined;
-      if (ctx.plain) return <span key={key} className="mention">@{displayName(user)}</span>;
-      return <button key={key} className="mention" onClick={(e) => ctx.onMention?.(user.id, e)}>@{displayName(user)}</button>;
+      const name = ctx.nameOf?.(user.id, user) ?? displayName(user); // no servidor, o apelido
+      if (ctx.plain) return <span key={key} className="mention">@{name}</span>;
+      return <button key={key} className="mention" onClick={(e) => ctx.onMention?.(user.id, e)}>@{name}</button>;
     }
     case 'channel': {
       const channel = ctx.channelsByName?.get(m[1].toLowerCase());

@@ -31,6 +31,7 @@ export function ProfileCard({ user, status, guildId, children, preview = false }
   const state = useStore((s) => s);
   const roles = guildId ? memberRoles(state, guildId, user.id).filter((r) => r.id !== guildId) : [];
   const joinedAt = guildId ? state.members[guildId]?.[user.id]?.joined_at : null;
+  const nick = guildId ? state.members[guildId]?.[user.id]?.nick : null;
   return (
     <div className="profile-card">
       <div className="profile-banner" style={{ background: user.banner_color ?? user.color }} />
@@ -39,8 +40,8 @@ export function ProfileCard({ user, status, guildId, children, preview = false }
       </div>
       <div className="profile-body">
         <div className="profile-names">
-          <div className="profile-display">{displayName(user)}</div>
-          <div className="profile-username">{user.username}</div>
+          <div className="profile-display">{nick || displayName(user)}</div>
+          <div className="profile-username">{user.username}{nick && <span className="muted"> · {displayName(user)}</span>}</div>
         </div>
         {(user.bio || preview) && (
           <section>

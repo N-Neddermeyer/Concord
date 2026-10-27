@@ -1,14 +1,16 @@
-import { ArrowDown, ArrowLeft, ArrowUp, EllipsisVertical, Plus, Search, Shield, Trash2, Upload, X } from 'lucide-react';
+import { ArrowDown, ArrowLeft, ArrowUp, EllipsisVertical, Image as ImageIcon, Plus, Search, Shield, Trash2, Upload, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { api } from '../../lib/api.js';
 import { confirmDialog, openMenu, openModal, openPopout, showError } from '../../lib/dialogs.js';
 import { pickImage } from '../../lib/image.js';
 import { P, PERMISSION_GROUPS, has, memberColor, permissionsFor, rankOf, sortedRoles } from '../../lib/permissions.js';
-import { closeLayer, openLayer, useStore } from '../../lib/store.js';
+import { TEXT, sidebarOrder } from '../../lib/channels.js';
+import { closeLayer, memberName, openLayer, useStore } from '../../lib/store.js';
 import { displayName, formatShortDate } from '../../lib/util.js';
 import Avatar from '../Avatar.jsx';
-import { BanModal, DeleteGuildModal } from '../modals.jsx';
-import SettingsLayout, { SaveBar, Toggle, isDirty } from './SettingsLayout.jsx';
+import { BanModal, DeleteGuildModal, NicknameModal } from '../modals.jsx';
+import AuditLog from './AuditLog.jsx';
+import SettingsLayout, { SaveBar, Toggle, ToggleRow, isDirty } from './SettingsLayout.jsx';
 
 const ROLE_COLORS = [
   '#1abc9c', '#2ecc71', '#3498db', '#9b59b6', '#e91e63', '#f1c40f', '#e67e22', '#e74c3c', '#95a5a6', '#607d8b',
@@ -33,8 +35,11 @@ export default function GuildSettings({ guildId, section = 'overview' }) {
     has(perms, P.MANAGE_GUILD) && { id: 'overview', label: 'Visão geral' },
     has(perms, P.MANAGE_ROLES) && { id: 'roles', label: 'Cargos' },
     { separator: true },
+    has(perms, P.VIEW_AUDIT_LOG) && { header: 'Moderação' },
+    has(perms, P.VIEW_AUDIT_LOG) && { id: 'audit-log', label: 'Registro de auditoria' },
+    has(perms, P.VIEW_AUDIT_LOG) && { separator: true },
     { header: 'Gestão de membros' },
-    (perms & (P.KICK_MEMBERS | P.BAN_MEMBERS | P.MANAGE_ROLES)) !== 0 && { id: 'members', label: 'Membros' },
+    (perms & (P.KICK_MEMBERS | P.BAN_MEMBERS | P.MANAGE_ROLES | P.MANAGE_NICKNAMES)) !== 0 && { id: 'members', label: 'Membros' },
     has(perms, P.MANAGE_GUILD) && { id: 'invites', label: 'Convites' },
     has(perms, P.BAN_MEMBERS) && { id: 'bans', label: 'Banimentos' },
     guild.owner_id === me.id && { separator: true },
@@ -42,7 +47,7 @@ export default function GuildSettings({ guildId, section = 'overview' }) {
   ];
   const allowed = items.filter((i) => i && i.id && !i.onClick).map((i) => i.id);
   const current = allowed.includes(section) ? section : allowed[0];
-  const Page = { overview: Overview, roles: Roles, members: Members, invites: Invites, bans: Bans }[current];
+  const Page = { overview: Overview, roles: Roles, 'audit-log': AuditLog, members: Members, invites: Invites, bans: Bans }[current];
 
   return (
     <SettingsLayout items={items} current={current} onSelect={go} onClose={closeLayer}>
@@ -53,11 +58,22 @@ export default function GuildSettings({ guildId, section = 'overview' }) {
 
 // --- Visão geral ---
 
+const SUPPRESS_JOIN_NOTIFICATIONS = 1 << 0;
+
 function Overview({ guild }) {
-  const original = { name: guild.name, icon: guild.icon };
+  const channels = useStore((s) => s.channels);
+  const original = {
+    name: guild.name,
+    icon: guild.icon,
+    banner: guild.banner,
+    system_channel_id: guild.system_channel_id,
+    system_channel_flags: guild.system_channel_flags,
+  };
   const [draft, setDraft] = useState(original);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
+  const set = (patch) => setDraft((d) => ({ ...d, ...patch }));
+  const textChannels = sidebarOrder(channels, guild.id).filter((c) => c.type === TEXT);
 
   const save = async () => {
     setBusy(true);
@@ -79,17 +95,55 @@ function Overview({ guild }) {
           <button
             className="icon-upload big"
             style={draft.icon ? { backgroundImage: `url(${draft.icon})` } : undefined}
-            onClick={() => pickImage(256).then((icon) => icon && setDraft((d) => ({ ...d, icon }))).catch((e) => showError(e.message))}
+            onClick={() => pickImage(256).then((icon) => icon && set({ icon })).catch((e) => showError(e.message))}
           >
             {!draft.icon && <><Upload size={24} /><span>ENVIAR IMAGEM</span></>}
           </button>
-          {draft.icon && <button className="button link-button small" onClick={() => setDraft((d) => ({ ...d, icon: null }))}>Remover</button>}
+          {draft.icon && <button className="button link-button small" onClick={() => set({ icon: null })}>Remover</button>}
           <p className="muted small">Recomendamos uma imagem de pelo menos 512x512 para o servidor.</p>
         </div>
         <label className="field grow">
           <span className="field-label">Nome do servidor</span>
-          <input className="input" value={draft.name} maxLength={100} onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))} />
+          <input className="input" value={draft.name} maxLength={100} onChange={(e) => set({ name: e.target.value })} />
         </label>
+      </div>
+
+      <div className="divider" />
+      <h3 className="section-heading">Mensagens do sistema</h3>
+      <label className="field">
+        <span className="field-label">Canal de mensagens do sistema</span>
+        <select className="input" value={draft.system_channel_id ?? ''} onChange={(e) => set({ system_channel_id: e.target.value || null })}>
+          <option value="">Sem mensagens do sistema</option>
+          {textChannels.map((c) => <option key={c.id} value={c.id}>#{c.name}</option>)}
+        </select>
+      </label>
+      <p className="muted small">Este é o canal para onde enviamos mensagens de eventos do sistema, como as de boas-vindas.</p>
+      <ToggleRow
+        title="Enviar uma mensagem aleatória de boas-vindas quando alguém entrar neste servidor."
+        checked={!(draft.system_channel_flags & SUPPRESS_JOIN_NOTIFICATIONS)}
+        disabled={!draft.system_channel_id}
+        onChange={(on) => set({ system_channel_flags: on ? draft.system_channel_flags & ~SUPPRESS_JOIN_NOTIFICATIONS : draft.system_channel_flags | SUPPRESS_JOIN_NOTIFICATIONS })}
+      />
+
+      <div className="divider" />
+      <h3 className="section-heading">Banner do servidor</h3>
+      <div className="banner-setting">
+        <div>
+          <p className="muted small">Este banner aparece no topo da lista de canais. A proporção recomendada é de 16:9, com pelo menos 960x540.</p>
+          <div className="row">
+            <button className="button brand small" onClick={() => pickImage(960, 540).then((banner) => banner && set({ banner })).catch((e) => showError(e.message))}>
+              Enviar fundo
+            </button>
+            {draft.banner && <button className="button link-button small" onClick={() => set({ banner: null })}>Remover</button>}
+          </div>
+        </div>
+        <button
+          className="banner-preview"
+          style={draft.banner ? { backgroundImage: `url(${draft.banner})` } : undefined}
+          onClick={() => pickImage(960, 540).then((banner) => banner && set({ banner })).catch((e) => showError(e.message))}
+        >
+          {!draft.banner && <><ImageIcon size={28} /><span>Escolher imagem</span></>}
+        </button>
       </div>
       <SaveBar visible={isDirty(draft, original)} busy={busy} error={error} onReset={() => setDraft(original)} onSave={save} />
     </>
@@ -393,7 +447,7 @@ function Members({ guild, perms }) {
               <button className="member-cell" onClick={(e) => openPopout({ userId: id, guildId: guild.id, rect: e.currentTarget.getBoundingClientRect() })}>
                 <Avatar user={user} size={32} />
                 <span>
-                  <b style={{ color: memberColor(state, guild.id, id) ?? undefined }}>{displayName(user)}</b>
+                  <b style={{ color: memberColor(state, guild.id, id) ?? undefined }}>{memberName(state, guild.id, id)}</b>
                   <small className="muted">{user.username}{id === guild.owner_id ? ' · dono' : ''}</small>
                 </span>
               </button>
@@ -423,7 +477,7 @@ function Members({ guild, perms }) {
                 )}
               </span>
               <span>
-                {outranked && (perms & (P.KICK_MEMBERS | P.BAN_MEMBERS)) !== 0 && (
+                {outranked && (perms & (P.KICK_MEMBERS | P.BAN_MEMBERS | P.MANAGE_NICKNAMES)) !== 0 && (
                   <button
                     className="icon-button"
                     aria-label="Mais opções"
@@ -431,6 +485,8 @@ function Members({ guild, perms }) {
                       rect: e.currentTarget.getBoundingClientRect(),
                       side: 'below',
                       items: [
+                        has(perms, P.MANAGE_NICKNAMES) && { label: 'Alterar apelido', onClick: () => openModal(NicknameModal, { guildId: guild.id, userId: id }) },
+                        has(perms, P.MANAGE_NICKNAMES) && (perms & (P.KICK_MEMBERS | P.BAN_MEMBERS)) !== 0 && { separator: true },
                         has(perms, P.KICK_MEMBERS) && { label: `Expulsar ${displayName(user)}`, danger: true, onClick: () => kick(user) },
                         has(perms, P.BAN_MEMBERS) && { label: `Banir ${displayName(user)}`, danger: true, onClick: () => openModal(BanModal, { guildId: guild.id, user }) },
                       ],

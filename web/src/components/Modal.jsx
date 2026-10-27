@@ -1,4 +1,4 @@
-import { X } from 'lucide-react';
+import { Check, X } from 'lucide-react';
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { closeMenu, closePopout, registerBuiltinDialogs, useDialogs } from '../lib/dialogs.js';
 import UserPopout from './UserPopout.jsx';
@@ -120,7 +120,9 @@ function Menu({ menu }) {
             }}
           >
             <span>{item.label}</span>
-            {item.icon && <item.icon size={18} />}
+            {item.checked !== undefined
+              ? <span className={`menu-check${item.checked ? ' on' : ''}`}>{item.checked && <Check size={14} strokeWidth={3} />}</span>
+              : item.icon && <item.icon size={18} />}
           </button>
         ),
       )}

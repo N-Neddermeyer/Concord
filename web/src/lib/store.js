@@ -13,10 +13,11 @@ const initialState = () => ({
   ready: false,
   user: null,
   users: {},
-  guilds: {}, // id -> { id, name, icon, owner_id, roles: { id -> role } }
+  guilds: {}, // id -> { id, name, icon, banner, owner_id, system_channel_id, system_channel_flags, roles: { id -> role } }
   guildOrder: [],
+  guildPositions: [], // ordem escolhida arrastando na barra (guild_positions das configurações)
   channels: {}, // canais de servidor e DMs
-  members: {}, // guildId -> { userId -> { roles, joined_at } }
+  members: {}, // guildId -> { userId -> { nick, roles, joined_at } }
   presences: {}, // userId -> 'online' | 'idle' | 'dnd' | 'offline'
   relationships: {}, // userId -> { type, since }
   voiceStates: {}, // userId -> { guild_id, channel_id, user_id, self_mute, self_deaf }
@@ -27,13 +28,16 @@ const initialState = () => ({
   pinsUpdated: {}, // channelId -> último CHANNEL_PINS_UPDATE (o popout de fixadas recarrega)
   manualUnread: {}, // channelId -> true: "marcar como não lida" (não confirma leitura sozinho)
   jump: null, // { channelId, messageId, nonce }: pular até uma mensagem
+  slowmode: {}, // channelId -> instante (ms) em que o modo lento libera o próximo envio
+  auditUpdated: {}, // guildId -> instante da última entrada nova no registro de auditoria
 
   // Estado local (salvo por usuário neste dispositivo).
   readStates: {}, // channelId -> id da última mensagem lida
   mentions: {}, // channelId -> menções não lidas (toda mensagem de DM conta)
   closedDms: {}, // channelId -> true (DM fechada na lista até chegar mensagem nova)
   nav: { guildId: HOME, channels: {} }, // canal escolhido por servidor (HOME -> DM ou null = Amigos)
-  collapsed: {}, // `${guildId}:${type}` -> true (categoria recolhida)
+  collapsed: {}, // id da categoria -> true (recolhida)
+  nsfwAllowed: {}, // channelId -> true: já confirmou a idade para ver este canal NSFW
   showMembers: true,
 
   // Camada sobre o app: configurações de usuário, servidor ou canal.
@@ -62,7 +66,7 @@ export const useStore = (selector) => useSyncExternalStore(subscribe, () => sele
 
 // --- persistência do estado local ---
 
-const LOCAL_KEYS = ['readStates', 'mentions', 'closedDms', 'nav', 'collapsed', 'showMembers'];
+const LOCAL_KEYS = ['readStates', 'mentions', 'closedDms', 'nav', 'collapsed', 'nsfwAllowed', 'showMembers'];
 let persistTimer = null;
 
 function persist() {
@@ -115,7 +119,7 @@ function addGuild(s, g) {
   const members = {};
   for (const m of g.members) {
     users[m.user.id] = m.user;
-    members[m.user.id] = { roles: m.roles, joined_at: m.joined_at };
+    members[m.user.id] = { nick: m.nick ?? null, roles: m.roles, joined_at: m.joined_at };
   }
   for (const p of g.presences) presences[p.user_id] = p.status;
   for (const v of g.voice_states) voiceStates[v.user_id] = v;
@@ -131,10 +135,26 @@ function addGuild(s, g) {
     voiceStates,
     channels,
     readStates,
-    guilds: { ...s.guilds, [g.id]: { id: g.id, name: g.name, icon: g.icon, owner_id: g.owner_id, roles: indexBy(g.roles) } },
-    guildOrder: s.guildOrder.includes(g.id) ? s.guildOrder : [...s.guildOrder, g.id],
+    guilds: { ...s.guilds, [g.id]: { ...guildFields(g), roles: indexBy(g.roles) } },
+    guildOrder: orderGuilds(s.guildOrder.includes(g.id) ? s.guildOrder : [...s.guildOrder, g.id], s.guildPositions),
     members: { ...s.members, [g.id]: members },
   };
+}
+
+const guildFields = (g) => ({
+  id: g.id,
+  name: g.name,
+  icon: g.icon ?? null,
+  banner: g.banner ?? null,
+  owner_id: g.owner_id,
+  system_channel_id: g.system_channel_id ?? null,
+  system_channel_flags: g.system_channel_flags ?? 0,
+});
+
+// Os da lista guild_positions primeiro, na ordem dela; o resto na ordem em que entrou.
+function orderGuilds(order, positions) {
+  const rank = (id) => (positions.includes(id) ? positions.indexOf(id) : positions.length);
+  return order.map((id, i) => [id, i]).sort((a, b) => rank(a[0]) - rank(b[0]) || a[1] - b[1]).map(([id]) => id);
 }
 
 function removeGuild(s, guildId) {
@@ -168,12 +188,10 @@ export const isPrivate = (channel) => channel?.type === 1 || channel?.type === 3
 
 const isMention = (s, m) => {
   if (m.referenced_message?.author.id === s.user.id && m.reply_ping) return true;
+  // @everyone/@here: o servidor diz se valeu (mention_everyone) conforme a permissão do autor.
+  if (m.mention_everyone) return true;
   const name = s.user.username.toLowerCase();
-  const channel = s.channels[m.channel_id];
-  return m.content.toLowerCase().split(/\s+/).some((word) => {
-    const token = word.replace(/[^\w.@]/g, '');
-    return token === `@${name}` || (!!channel?.guild_id && (token === '@everyone' || token === '@here'));
-  });
+  return m.content.toLowerCase().split(/\s+/).some((word) => word.replace(/[^\w.@]/g, '') === `@${name}`);
 };
 
 const TYPING_MS = 10_000;
@@ -196,6 +214,7 @@ function reduce(s, { type, d }) {
         user: d.user,
         users: { [d.user.id]: d.user },
         layer: s.user?.id === d.user.id ? s.layer : null,
+        guildPositions: d.user_settings?.guild_positions ?? [],
       };
       next.presences = { [d.user.id]: d.user.status === 'invisible' ? 'offline' : d.user.status };
       for (const g of d.guilds) next = addGuild(next, g);
@@ -225,7 +244,7 @@ function reduce(s, { type, d }) {
     case 'GUILD_UPDATE': {
       const guild = s.guilds[d.id];
       if (!guild) return s;
-      return { ...s, guilds: { ...s.guilds, [d.id]: { ...guild, name: d.name, icon: d.icon, owner_id: d.owner_id } } };
+      return { ...s, guilds: { ...s.guilds, [d.id]: { ...guild, ...guildFields(d) } } };
     }
 
     case 'GUILD_DELETE':
@@ -238,13 +257,13 @@ function reduce(s, { type, d }) {
     }
 
     case 'GUILD_MEMBER_ADD': {
-      const next = setMember(s, d.guild_id, d.user.id, { roles: d.roles ?? [], joined_at: d.joined_at });
+      const next = setMember(s, d.guild_id, d.user.id, { nick: d.nick ?? null, roles: d.roles ?? [], joined_at: d.joined_at });
       return { ...next, users: { ...s.users, [d.user.id]: d.user }, presences: { ...s.presences, [d.user.id]: d.status } };
     }
 
     case 'GUILD_MEMBER_UPDATE':
       if (!s.members[d.guild_id]) return s;
-      return { ...setMember(s, d.guild_id, d.user.id, { roles: d.roles, joined_at: d.joined_at }), users: { ...s.users, [d.user.id]: d.user } };
+      return { ...setMember(s, d.guild_id, d.user.id, { nick: d.nick ?? null, roles: d.roles, joined_at: d.joined_at }), users: { ...s.users, [d.user.id]: d.user } };
 
     case 'GUILD_MEMBER_REMOVE':
       if (!s.members[d.guild_id]) return s;
@@ -292,8 +311,24 @@ function reduce(s, { type, d }) {
       if (d.id === s.user.id) return { ...s, user: { ...s.user, ...d }, users: { ...s.users, [d.id]: { ...s.users[d.id], ...d } } };
       return { ...s, users: { ...s.users, [d.id]: d } };
 
-    case 'USER_SETTINGS_UPDATE':
-      return { ...s, user: { ...s.user, ...d } };
+    case 'USER_SETTINGS_UPDATE': {
+      const { guild_positions: positions, ...settings } = d;
+      if (!positions) return { ...s, user: { ...s.user, ...settings } };
+      return { ...s, user: { ...s.user, ...settings }, guildPositions: positions, guildOrder: orderGuilds(s.guildOrder, positions) };
+    }
+
+    // Ordem nova arrastando na barra: aplica na hora (o servidor confirma com USER_SETTINGS_UPDATE).
+    case 'GUILD_ORDER':
+      return { ...s, guildPositions: d, guildOrder: orderGuilds(s.guildOrder, d) };
+
+    case 'GUILD_AUDIT_LOG_ENTRY_CREATE':
+      return { ...s, auditUpdated: { ...s.auditUpdated, [d.guild_id]: Date.now() } };
+
+    case 'SLOWMODE_START':
+      return { ...s, slowmode: { ...s.slowmode, [d.channelId]: d.until } };
+
+    case 'NSFW_ALLOW':
+      return { ...s, nsfwAllowed: { ...s.nsfwAllowed, [d]: true } };
 
     case 'RELATIONSHIP_ADD':
       return {
@@ -463,6 +498,10 @@ export const isUnread = (s, channel) =>
   !!channel?.last_message_id && (!s.readStates[channel.id] || compareIds(channel.last_message_id, s.readStates[channel.id]) > 0);
 
 export const dmRecipient = (s, channel) => s.users[channel.recipients[0]?.id] ?? channel.recipients[0];
+
+// Nome mostrado num servidor: o apelido, senão o nome exibido, senão o nome de usuário.
+export const memberName = (s, guildId, userId, fallback) =>
+  (guildId && s.members[guildId]?.[userId]?.nick) || displayName(s.users[userId] ?? fallback);
 
 // Nome de um canal privado: o outro participante (DM) ou o nome do grupo / nomes de quem está nele.
 export function privateChannelName(s, channel) {

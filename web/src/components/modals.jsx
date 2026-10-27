@@ -1,11 +1,13 @@
-import { Check, ChevronRight, Copy, Hash, Search, Upload, Volume2 } from 'lucide-react';
+import { Check, ChevronRight, Copy, Hash, Lock, Search, Upload, Volume2 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { api } from '../lib/api.js';
 import { pickImage } from '../lib/image.js';
-import { HOME, REL, dmRecipient, navigate, privateChannelName, useStore } from '../lib/store.js';
+import { OVERWRITE_MEMBER, OVERWRITE_ROLE, P, channelPermissionsFor, has, permissionsFor, sortedRoles } from '../lib/permissions.js';
+import { HOME, REL, dmRecipient, getState, memberName, navigate, privateChannelName, useStore } from '../lib/store.js';
 import { displayName } from '../lib/util.js';
 import Avatar, { GroupIcon, GuildIcon } from './Avatar.jsx';
 import { Modal } from './Modal.jsx';
+import { Toggle } from './settings/SettingsLayout.jsx';
 
 function useSubmit(action) {
   const [busy, setBusy] = useState(false);
@@ -124,26 +126,130 @@ export function AddGuildModal({ close }) {
   );
 }
 
-// --- canal ---
+// --- canal e categoria ---
 
-export function CreateChannelModal({ close, guildId, type: initialType = 0 }) {
+// Overwrites de um canal privado: os da categoria (se houver), o @everyone sem "Ver canal" e
+// "Ver canal" para quem foi escolhido. Quem cria entra junto, a menos que já passe por cima de tudo.
+function privateOverwrites(state, guildId, parentId, picked) {
+  const guild = state.guilds[guildId];
+  const base = (parentId ? state.channels[parentId]?.permission_overwrites ?? [] : []).map((o) => ({ ...o }));
+  const upsert = (id, type, allow, deny) => {
+    let o = base.find((x) => x.id === id);
+    if (!o) base.push((o = { id, type, allow: 0, deny: 0 }));
+    o.allow = (o.allow | allow) & ~deny;
+    o.deny = (o.deny | deny) & ~allow;
+  };
+  upsert(guild.id, OVERWRITE_ROLE, 0, P.VIEW_CHANNEL);
+  for (const { id, type } of picked) upsert(id, type, P.VIEW_CHANNEL, 0);
+  const me = state.user.id;
+  if (guild.owner_id !== me && !has(permissionsFor(state, guildId), P.ADMINISTRATOR) && !picked.some((p) => p.id === me)) {
+    upsert(me, OVERWRITE_MEMBER, P.VIEW_CHANNEL, 0);
+  }
+  return base;
+}
+
+// Escolher cargos e membros (canal privado: "Adicionar membros ou cargos"). exclude: ids já escolhidos antes.
+export function AccessPicker({ guildId, picked, onChange, exclude = [] }) {
+  const state = useStore((s) => s);
+  const [query, setQuery] = useState('');
+  const guild = state.guilds[guildId];
+  const q = query.toLowerCase();
+  const roles = sortedRoles(guild).filter((r) => r.id !== guild.id && !exclude.includes(r.id) && r.name.toLowerCase().includes(q));
+  const members = Object.keys(state.members[guildId] ?? {})
+    .filter((id) => id !== guild.owner_id && !exclude.includes(id) && `${memberName(state, guildId, id)} ${state.users[id]?.username}`.toLowerCase().includes(q))
+    .sort((a, b) => memberName(state, guildId, a).localeCompare(memberName(state, guildId, b)));
+  const isPicked = (id) => picked.some((p) => p.id === id);
+  const toggle = (id, type) => onChange(isPicked(id) ? picked.filter((p) => p.id !== id) : [...picked, { id, type }]);
+
+  return (
+    <>
+      <input className="input" placeholder="Buscar membros e cargos" value={query} autoFocus onChange={(e) => setQuery(e.target.value)} />
+      <div className="pick-list access-list">
+        {roles.length > 0 && <h3 className="pick-heading">Cargos</h3>}
+        {roles.map((r) => (
+          <button key={r.id} className={`pick-item${isPicked(r.id) ? ' selected' : ''}`} onClick={() => toggle(r.id, OVERWRITE_ROLE)}>
+            <span className="role-dot big" style={{ background: r.color ?? '#99aab5' }} />
+            <span>{r.name}</span>
+            <span className="checkbox">{isPicked(r.id) && <Check size={14} />}</span>
+          </button>
+        ))}
+        {members.length > 0 && <h3 className="pick-heading">Membros</h3>}
+        {members.map((id) => (
+          <button key={id} className={`pick-item${isPicked(id) ? ' selected' : ''}`} onClick={() => toggle(id, OVERWRITE_MEMBER)}>
+            <Avatar user={state.users[id]} size={24} />
+            <span>{memberName(state, guildId, id)}</span>
+            <span className="muted small">{state.users[id]?.username}</span>
+            <span className="checkbox">{isPicked(id) && <Check size={14} />}</span>
+          </button>
+        ))}
+        {!roles.length && !members.length && <p className="muted center">Nenhum resultado.</p>}
+      </div>
+    </>
+  );
+}
+
+function PrivateToggle({ label, checked, onChange }) {
+  return (
+    <div className="private-toggle">
+      <Lock size={18} />
+      <div>
+        <div className="toggle-title">{label}</div>
+        <div className="toggle-description">Somente membros e cargos selecionados poderão ver {label === 'Categoria privada' ? 'esta categoria' : 'este canal'}.</div>
+      </div>
+      <Toggle checked={checked} onChange={onChange} />
+    </div>
+  );
+}
+
+export function CreateChannelModal({ close, guildId, type: initialType = 0, parentId = null }) {
+  const state = useStore((s) => s);
+  const parent = parentId ? state.channels[parentId] : null;
+  const canPrivate = has(parentId ? channelPermissionsFor(state, parentId) : permissionsFor(state, guildId), P.MANAGE_ROLES);
   const [type, setType] = useState(initialType);
   const [name, setName] = useState('');
+  const [isPrivate, setPrivate] = useState(false);
+  const [step, setStep] = useState('main');
+  const [picked, setPicked] = useState([]);
   const [create, busy, error] = useSubmit(async () => {
-    const channel = await api(`/guilds/${guildId}/channels`, { method: 'POST', body: { name, type } });
+    const body = { name, type, parent_id: parentId };
+    if (isPrivate) body.permission_overwrites = privateOverwrites(getState(), guildId, parentId, picked);
+    const channel = await api(`/guilds/${guildId}/channels`, { method: 'POST', body });
     if (type === 0) navigate(guildId, channel.id);
     close(channel);
   });
   const shown = type === 0 ? name.toLowerCase().replace(/\s+/g, '-') : name;
+  const Icon = type === 0 ? Hash : Volume2;
+
+  if (step === 'access') {
+    return (
+      <Modal
+        title="Adicionar membros ou cargos"
+        subtitle={<span className="channel-subtitle"><Icon size={14} /> {shown}</span>}
+        onClose={close}
+        footer={
+          <>
+            <button className="button link-button" onClick={create} disabled={busy}>Pular</button>
+            <button className="button brand" disabled={busy} onClick={create}>Criar canal</button>
+          </>
+        }
+      >
+        <AccessPicker guildId={guildId} picked={picked} onChange={setPicked} />
+        {error && <p className="error">{error}</p>}
+      </Modal>
+    );
+  }
 
   return (
     <Modal
       title="Criar canal"
+      subtitle={parent ? `em ${parent.name}` : undefined}
       onClose={close}
       footer={
         <>
           <button className="button link-button" onClick={() => close()}>Cancelar</button>
-          <button className="button brand" disabled={busy || !name.trim()} onClick={create}>Criar canal</button>
+          {isPrivate
+            ? <button className="button brand" disabled={!name.trim()} onClick={() => setStep('access')}>Avançar</button>
+            : <button className="button brand" disabled={busy || !name.trim()} onClick={create}>Criar canal</button>}
         </>
       }
     >
@@ -151,9 +257,9 @@ export function CreateChannelModal({ close, guildId, type: initialType = 0 }) {
       {[
         [0, Hash, 'Texto', 'Envie mensagens, imagens, GIFs, emojis, opiniões e piadas'],
         [2, Volume2, 'Voz', 'Converse por voz com outras pessoas'],
-      ].map(([value, Icon, label, hint]) => (
+      ].map(([value, TypeIcon, label, hint]) => (
         <button key={value} className={`radio-card${type === value ? ' selected' : ''}`} onClick={() => setType(value)}>
-          <Icon size={24} />
+          <TypeIcon size={24} />
           <span><b>{label}</b><small>{hint}</small></span>
           <span className="radio-dot" />
         </button>
@@ -161,11 +267,106 @@ export function CreateChannelModal({ close, guildId, type: initialType = 0 }) {
       <label className="field">
         <span className="field-label">Nome do canal</span>
         <div className="input-with-icon">
-          {type === 0 ? <Hash size={16} /> : <Volume2 size={16} />}
+          {isPrivate ? <Lock size={16} /> : <Icon size={16} />}
           <input className="input" value={shown} placeholder="novo-canal" maxLength={100} autoFocus
-            onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && name.trim() && create()} />
+            onChange={(e) => setName(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && name.trim() && (isPrivate ? setStep('access') : create())} />
         </div>
       </label>
+      {canPrivate && <PrivateToggle label="Canal privado" checked={isPrivate} onChange={setPrivate} />}
+      {error && <p className="error">{error}</p>}
+    </Modal>
+  );
+}
+
+export function CreateCategoryModal({ close, guildId }) {
+  const canPrivate = useStore((s) => has(permissionsFor(s, guildId), P.MANAGE_ROLES));
+  const [name, setName] = useState('');
+  const [isPrivate, setPrivate] = useState(false);
+  const [step, setStep] = useState('main');
+  const [picked, setPicked] = useState([]);
+  const [create, busy, error] = useSubmit(async () => {
+    const body = { name, type: 4 };
+    if (isPrivate) body.permission_overwrites = privateOverwrites(getState(), guildId, null, picked);
+    close(await api(`/guilds/${guildId}/channels`, { method: 'POST', body }));
+  });
+
+  if (step === 'access') {
+    return (
+      <Modal
+        title="Adicionar membros ou cargos"
+        subtitle={name}
+        onClose={close}
+        footer={
+          <>
+            <button className="button link-button" onClick={create} disabled={busy}>Pular</button>
+            <button className="button brand" disabled={busy} onClick={create}>Criar categoria</button>
+          </>
+        }
+      >
+        <AccessPicker guildId={guildId} picked={picked} onChange={setPicked} />
+        {error && <p className="error">{error}</p>}
+      </Modal>
+    );
+  }
+
+  return (
+    <Modal
+      title="Criar categoria"
+      onClose={close}
+      footer={
+        <>
+          <button className="button link-button" onClick={() => close()}>Cancelar</button>
+          {isPrivate
+            ? <button className="button brand" disabled={!name.trim()} onClick={() => setStep('access')}>Avançar</button>
+            : <button className="button brand" disabled={busy || !name.trim()} onClick={create}>Criar categoria</button>}
+        </>
+      }
+    >
+      <label className="field">
+        <span className="field-label">Nome da categoria</span>
+        <input className="input" value={name} placeholder="Nova categoria" maxLength={100} autoFocus
+          onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && name.trim() && (isPrivate ? setStep('access') : create())} />
+      </label>
+      {canPrivate && <PrivateToggle label="Categoria privada" checked={isPrivate} onChange={setPrivate} />}
+      {error && <p className="error">{error}</p>}
+    </Modal>
+  );
+}
+
+// --- apelido ("Alterar apelido" / "Editar perfil do servidor") ---
+
+export function NicknameModal({ close, guildId, userId }) {
+  const state = useStore((s) => s);
+  const isMe = userId === state.user.id;
+  const user = state.users[userId];
+  const current = state.members[guildId]?.[userId]?.nick ?? '';
+  const [nick, setNick] = useState(current);
+  const [save, busy, error] = useSubmit(async (value) => {
+    await api(`/guilds/${guildId}/members/${isMe ? '@me' : userId}`, { method: 'PATCH', body: { nick: value } });
+    close(true);
+  });
+
+  return (
+    <Modal
+      title="Alterar apelido"
+      onClose={close}
+      className="small"
+      footer={
+        <>
+          <button className="button link-button" onClick={() => close(false)}>Cancelar</button>
+          <button className="button brand" disabled={busy} onClick={() => save(nick)}>Salvar</button>
+        </>
+      }
+    >
+      {!isMe && <div className="warning-box">Apelidos podem ser vistos por todos neste servidor. Não os altere sem um bom motivo.</div>}
+      <label className="field">
+        <span className="field-label">Apelido</span>
+        <input className="input" value={nick} maxLength={32} placeholder={displayName(user)} autoFocus
+          onChange={(e) => setNick(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && save(nick)} />
+      </label>
+      <button className="button link-button small reset-nick" disabled={busy || !current} onClick={() => save('')}>Redefinir apelido</button>
       {error && <p className="error">{error}</p>}
     </Modal>
   );

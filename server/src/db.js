@@ -2,8 +2,8 @@ import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import sqlite from 'node-sqlite3-wasm';
-import { DEFAULT_PERMISSIONS } from './permissions.js';
-import { timestampOf } from './snowflake.js';
+import { DEFAULT_PERMISSIONS, IMPLICIT_BEFORE_OVERWRITES } from './permissions.js';
+import { snowflake, timestampOf } from './snowflake.js';
 
 // SQLite compilado em WebAssembly: dispensa compilar módulo nativo no Windows.
 const dataDir = process.env.DATA_DIR ?? path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'data');
@@ -199,6 +199,56 @@ const migrations = [
       CREATE INDEX attachments_by_message ON attachments(message_id);
     `);
   },
+  // 5: categorias, overwrites de permissão, modo lento, NSFW, apelidos, registro de auditoria,
+  // banner e canal de sistema do servidor, ordem dos servidores na barra.
+  () => {
+    db.exec(`
+      ALTER TABLE channels ADD COLUMN parent_id TEXT;
+      ALTER TABLE channels ADD COLUMN nsfw INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE channels ADD COLUMN rate_limit_per_user INTEGER NOT NULL DEFAULT 0;
+      CREATE TABLE permission_overwrites (
+        channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+        target_id  TEXT NOT NULL,
+        type       INTEGER NOT NULL,
+        allow      INTEGER NOT NULL DEFAULT 0,
+        deny       INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (channel_id, target_id)
+      );
+      ALTER TABLE members ADD COLUMN nick TEXT;
+      ALTER TABLE guilds ADD COLUMN banner TEXT;
+      ALTER TABLE guilds ADD COLUMN system_channel_id TEXT;
+      ALTER TABLE guilds ADD COLUMN system_channel_flags INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE users ADD COLUMN guild_positions TEXT;
+      ALTER TABLE messages ADD COLUMN mention_everyone INTEGER NOT NULL DEFAULT 0;
+      CREATE TABLE audit_log (
+        id          TEXT PRIMARY KEY,
+        guild_id    TEXT NOT NULL REFERENCES guilds(id) ON DELETE CASCADE,
+        user_id     TEXT NOT NULL,
+        target_id   TEXT,
+        action_type INTEGER NOT NULL,
+        changes     TEXT,
+        options     TEXT,
+        reason      TEXT
+      );
+      CREATE INDEX audit_log_by_guild ON audit_log(guild_id, id);
+      UPDATE messages SET mention_everyone = 1
+        WHERE (content LIKE '%@everyone%' OR content LIKE '%@here%')
+          AND channel_id IN (SELECT id FROM channels WHERE guild_id IS NOT NULL);
+      UPDATE guilds SET system_channel_id =
+        (SELECT id FROM channels c WHERE c.guild_id = guilds.id AND c.type = 0 ORDER BY c.position, c.id LIMIT 1);
+    `);
+    db.prepare('UPDATE roles SET permissions = permissions | ? WHERE id = guild_id').run(IMPLICIT_BEFORE_OVERWRITES);
+    // Os canais existentes ficam nas categorias que a barra lateral já mostrava.
+    const guilds = database.all('SELECT id FROM guilds');
+    for (const { id } of guilds) {
+      const text = snowflake();
+      const voice = snowflake();
+      database.run('INSERT INTO channels (id, guild_id, name, type, position) VALUES (?, ?, ?, 4, 0)', [text, id, 'Canais de texto']);
+      database.run('INSERT INTO channels (id, guild_id, name, type, position) VALUES (?, ?, ?, 4, 1)', [voice, id, 'Canais de voz']);
+      database.run('UPDATE channels SET parent_id = ? WHERE guild_id = ? AND type = 0', [text, id]);
+      database.run('UPDATE channels SET parent_id = ? WHERE guild_id = ? AND type = 2', [voice, id]);
+    }
+  },
 ];
 
 // Mudanças de esquema rodam com as chaves estrangeiras desligadas (exigência do SQLite
@@ -226,6 +276,7 @@ export const CHANNEL_TEXT = 0;
 export const CHANNEL_DM = 1;
 export const CHANNEL_VOICE = 2;
 export const CHANNEL_GROUP_DM = 3;
+export const CHANNEL_CATEGORY = 4;
 
 export const REL = { FRIEND: 1, BLOCKED: 2, INCOMING: 3, OUTGOING: 4 };
 // Tipos de mensagem do Discord usados aqui.
@@ -236,6 +287,7 @@ export const MSG = {
   CALL: 3,
   CHANNEL_NAME_CHANGE: 4,
   CHANNEL_PINNED_MESSAGE: 6,
+  USER_JOIN: 7,
   REPLY: 19,
 };
 export const MESSAGE_CALL = MSG.CALL;
@@ -253,20 +305,23 @@ export const q = {
     UPDATE users SET username = ?, password_hash = ?, token = ?, global_name = ?, avatar = ?, banner_color = ?, bio = ?
     WHERE id = ?`),
   setStatus: db.prepare('UPDATE users SET status = ? WHERE id = ?'),
+  setGuildPositions: db.prepare('UPDATE users SET guild_positions = ? WHERE id = ?'),
 
   guild: db.prepare('SELECT * FROM guilds WHERE id = ?'),
   guildsOf: db.prepare('SELECT g.* FROM guilds g JOIN members m ON m.guild_id = g.id WHERE m.user_id = ? ORDER BY m.joined_at'),
   insertGuild: db.prepare('INSERT INTO guilds (id, name, owner_id) VALUES (?, ?, ?)'),
-  updateGuild: db.prepare('UPDATE guilds SET name = ?, icon = ? WHERE id = ?'),
+  updateGuild: db.prepare('UPDATE guilds SET name = ?, icon = ?, banner = ?, system_channel_id = ?, system_channel_flags = ? WHERE id = ?'),
+  clearSystemChannel: db.prepare('UPDATE guilds SET system_channel_id = NULL WHERE system_channel_id = ?'),
   deleteGuild: db.prepare('DELETE FROM guilds WHERE id = ?'),
 
   member: db.prepare('SELECT * FROM members WHERE guild_id = ? AND user_id = ?'),
   memberIds: db.prepare('SELECT user_id FROM members WHERE guild_id = ?'),
   membersOf: db.prepare(`
-    SELECT u.id, ${AUTHOR_COLUMNS}, m.joined_at FROM members m
+    SELECT u.id, ${AUTHOR_COLUMNS}, m.joined_at, m.nick FROM members m
     JOIN users u ON u.id = m.user_id WHERE m.guild_id = ? ORDER BY u.username`),
   insertMember: db.prepare('INSERT INTO members (guild_id, user_id, joined_at) VALUES (?, ?, ?)'),
   deleteMember: db.prepare('DELETE FROM members WHERE guild_id = ? AND user_id = ?'),
+  setNick: db.prepare('UPDATE members SET nick = ? WHERE guild_id = ? AND user_id = ?'),
   // Todos que dividem algum servidor com o usuário (para presença e atualizações de perfil).
   guildmates: db.prepare(`
     SELECT DISTINCT o.user_id FROM members m JOIN members o ON o.guild_id = m.guild_id WHERE m.user_id = ?`),
@@ -289,8 +344,18 @@ export const q = {
   channel: db.prepare('SELECT * FROM channels WHERE id = ?'),
   channelsOf: db.prepare('SELECT * FROM channels WHERE guild_id = ? ORDER BY position, id'),
   nextChannelPosition: db.prepare('SELECT COALESCE(MAX(position), -1) + 1 AS pos FROM channels WHERE guild_id = ?'),
-  insertChannel: db.prepare('INSERT INTO channels (id, guild_id, name, type, position) VALUES (?, ?, ?, ?, ?)'),
+  insertChannel: db.prepare('INSERT INTO channels (id, guild_id, name, type, position, parent_id) VALUES (?, ?, ?, ?, ?, ?)'),
   updateChannel: db.prepare('UPDATE channels SET name = ?, topic = ? WHERE id = ?'),
+  updateGuildChannel: db.prepare('UPDATE channels SET name = ?, topic = ?, nsfw = ?, rate_limit_per_user = ? WHERE id = ?'),
+  moveChannel: db.prepare('UPDATE channels SET position = ?, parent_id = ? WHERE id = ?'),
+  orphanChildren: db.prepare('UPDATE channels SET parent_id = NULL WHERE parent_id = ?'),
+  overwritesOf: db.prepare('SELECT * FROM permission_overwrites WHERE channel_id = ? ORDER BY type, target_id'),
+  guildOverwrites: db.prepare(`
+    SELECT o.* FROM permission_overwrites o JOIN channels c ON c.id = o.channel_id WHERE c.guild_id = ? ORDER BY o.type, o.target_id`),
+  insertOverwrite: db.prepare('INSERT INTO permission_overwrites (channel_id, target_id, type, allow, deny) VALUES (?, ?, ?, ?, ?)'),
+  clearOverwrites: db.prepare('DELETE FROM permission_overwrites WHERE channel_id = ?'),
+  deleteOverwritesFor: db.prepare(`
+    DELETE FROM permission_overwrites WHERE target_id = ? AND channel_id IN (SELECT id FROM channels WHERE guild_id = ?)`),
   deleteChannel: db.prepare('DELETE FROM channels WHERE id = ?'),
   touchChannel: db.prepare('UPDATE channels SET last_message_id = ? WHERE id = ?'),
 
@@ -338,8 +403,8 @@ export const q = {
       ),
   },
   insertMessage: db.prepare(`
-    INSERT INTO messages (id, channel_id, author_id, content, type, reference_id, reply_ping, meta)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`),
+    INSERT INTO messages (id, channel_id, author_id, content, type, reference_id, reply_ping, meta, mention_everyone)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`),
   editMessage: db.prepare('UPDATE messages SET content = ?, edited_at = ? WHERE id = ?'),
   setPinned: db.prepare('UPDATE messages SET pinned_at = ? WHERE id = ?'),
   pinsOf: db.prepare(`
@@ -367,6 +432,17 @@ export const q = {
   insertInvite: db.prepare('INSERT INTO invites (code, guild_id, creator_id, created_at) VALUES (?, ?, ?, ?)'),
   useInvite: db.prepare('UPDATE invites SET uses = uses + 1 WHERE code = ?'),
   deleteInvite: db.prepare('DELETE FROM invites WHERE code = ?'),
+
+  insertAudit: db.prepare(`
+    INSERT INTO audit_log (id, guild_id, user_id, target_id, action_type, changes, options, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`),
+  auditLog: {
+    all: ({ guild, user, action, before, limit }) =>
+      database.all(
+        `SELECT * FROM audit_log WHERE guild_id = ? AND (? IS NULL OR user_id = ?) AND (? IS NULL OR action_type = ?)
+         AND (? IS NULL OR id < ?) ORDER BY id DESC LIMIT ?`,
+        [guild, user, user, action, action, before, before, limit],
+      ),
+  },
 
   ban: db.prepare('SELECT * FROM bans WHERE guild_id = ? AND user_id = ?'),
   bansOf: db.prepare(`
@@ -410,6 +486,7 @@ export function toMessage(m) {
     message.reply_ping = !!m.reply_ping;
   }
   if (m.meta) message.meta = JSON.parse(m.meta);
+  message.mention_everyone = !!m.mention_everyone;
   message.attachments = [];
   return message;
 }
@@ -424,6 +501,23 @@ export const toAttachment = (a) => ({
   content_type: a.content_type ?? null,
   width: a.width ?? null,
   height: a.height ?? null,
+});
+
+export const toOverwrite = (o) => ({ id: o.target_id, type: o.type, allow: o.allow, deny: o.deny });
+
+// Canal de servidor no formato do Discord (com os overwrites de permissão).
+export const toChannel = (c, overwrites = q.overwritesOf.all(c.id).map(toOverwrite)) => ({
+  id: c.id,
+  type: c.type,
+  guild_id: c.guild_id,
+  name: c.name,
+  position: c.position,
+  parent_id: c.parent_id ?? null,
+  topic: c.topic ?? '',
+  nsfw: !!c.nsfw,
+  rate_limit_per_user: c.rate_limit_per_user ?? 0,
+  last_message_id: c.last_message_id ?? null,
+  permission_overwrites: overwrites,
 });
 
 // Completa as mensagens com reações, a mensagem respondida e os usuários citados nas

@@ -38,8 +38,9 @@ function useSuggestions(trigger, channel) {
     const { char, query } = trigger;
     if (char === '@') {
       const ids = channel.guild_id ? Object.keys(members ?? {}) : [me.id, ...channel.recipients.map((u) => u.id)];
+      const nameOf = (u) => members?.[u.id]?.nick || displayName(u); // no servidor, o apelido
       const rank = (u) => {
-        const name = displayName(u).toLowerCase();
+        const name = nameOf(u).toLowerCase();
         const username = u.username.toLowerCase();
         if (!query) return 1;
         if (username.startsWith(query) || name.startsWith(query)) return 0;
@@ -48,9 +49,9 @@ function useSuggestions(trigger, channel) {
       const people = ids
         .map((id) => users[id])
         .filter((u) => u && rank(u) >= 0)
-        .sort((a, b) => rank(a) - rank(b) || displayName(a).localeCompare(displayName(b)))
+        .sort((a, b) => rank(a) - rank(b) || nameOf(a).localeCompare(nameOf(b)))
         .slice(0, MAX_SUGGESTIONS)
-        .map((u) => ({ key: u.id, insert: `@${u.username} `, user: u }));
+        .map((u) => ({ key: u.id, insert: `@${u.username} `, user: u, name: nameOf(u) }));
       const special = channel.guild_id
         ? [
           { key: 'everyone', insert: '@everyone ', label: '@everyone', hint: 'Notifica todos que têm permissão para ver este canal.' },
@@ -89,7 +90,7 @@ function Suggestions({ list, selected, onHover, onPick }) {
           {item.user && (
             <>
               <Avatar user={item.user} size={24} />
-              <span className="autocomplete-name">{displayName(item.user)}</span>
+              <span className="autocomplete-name">{item.name}</span>
               <span className="autocomplete-hint">{item.user.username}</span>
             </>
           )}
@@ -179,7 +180,9 @@ function PendingCard({ pending, onChange, onRemove }) {
 
 export default function Composer({
   channel, placeholder, replyTo, onClearReply, onRestoreReply, onSent, onEditLast, onUpload, apiRef, textareaRef,
+  canAttach = true, slowmode = 0,
 }) {
+  const cooldown = useCooldown(channel.id);
   const [draft, setDraft] = useState('');
   const [files, setFiles] = useState([]);
   const [caret, setCaret] = useState(0);
@@ -226,6 +229,7 @@ export default function Composer({
   };
 
   const addFiles = async (list) => {
+    if (!canAttach) return showError('Você não tem permissão para enviar arquivos neste canal.');
     const pending = await prepare(list, files.length);
     if (!pending) return;
     setFiles((current) => [...current, ...pending]);
@@ -234,6 +238,7 @@ export default function Composer({
 
   // Shift ao soltar: envia os arquivos na hora, sem passar pelo compositor.
   const sendFilesNow = async (list) => {
+    if (!canAttach) return showError('Você não tem permissão para enviar arquivos neste canal.');
     const pending = await prepare(list, 0);
     if (pending) send({ only: pending });
   };
@@ -242,6 +247,7 @@ export default function Composer({
     const content = only ? '' : draft.trim();
     const attached = only ?? files;
     if (!content && !attached.length) return;
+    if (cooldown > 0) return; // modo lento: espera o contador zerar
     if (content.length > MAX_LENGTH) {
       const ok = await confirmDialog({
         title: 'Sua mensagem é muito longa',
@@ -280,13 +286,17 @@ export default function Composer({
       // A resposta também chega via gateway (MESSAGE_CREATE); o store ignora duplicatas pelo id.
       const message = await api(`/channels/${channel.id}/messages`, { method: 'POST', body });
       dispatch({ type: 'MESSAGE_CREATE', d: message });
+      if (slowmode) dispatch({ type: 'SLOWMODE_START', d: { channelId: channel.id, until: Date.now() + slowmode * 1000 } });
       attached.forEach(releasePending);
     } catch (e) {
       // Falhou ou foi cancelado: devolve texto e anexos ao compositor (se ele ainda estiver vazio).
       if (content) setDraft((d) => d || content);
       setFiles((current) => (current.length ? current : attached));
       if (reply) onRestoreReply(reply);
-      if (e.name !== 'AbortError') showError(e.message);
+      // 429 do modo lento: só liga o contador com o tempo que o servidor informou.
+      if (e.status === 429 && e.data?.retry_after) {
+        dispatch({ type: 'SLOWMODE_START', d: { channelId: channel.id, until: Date.now() + e.data.retry_after * 1000 } });
+      } else if (e.name !== 'AbortError') showError(e.message);
     } finally {
       if (attached.length) onUpload(null);
     }
@@ -402,15 +412,17 @@ export default function Composer({
         </ul>
       )}
       <div className="composer-row">
-        <button
-          ref={plusButton}
-          className="composer-button attach"
-          aria-label="Enviar um arquivo"
-          onClick={openPlus}
-          onDoubleClick={() => fileInput.current.click()}
-        >
-          <PlusCircle size={24} fill="currentColor" stroke="var(--bg-textarea)" />
-        </button>
+        {canAttach ? (
+          <button
+            ref={plusButton}
+            className="composer-button attach"
+            aria-label="Enviar um arquivo"
+            onClick={openPlus}
+            onDoubleClick={() => fileInput.current.click()}
+          >
+            <PlusCircle size={24} fill="currentColor" stroke="var(--bg-textarea)" />
+          </button>
+        ) : <span className="composer-spacer" />}
         <input
           ref={fileInput}
           type="file"
@@ -443,6 +455,19 @@ export default function Composer({
       </div>
     </div>
   );
+}
+
+// Segundos que faltam do modo lento neste canal (0 = liberado), atualizando a cada segundo.
+export function useCooldown(channelId) {
+  const until = useStore((s) => s.slowmode[channelId] ?? 0);
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (until <= Date.now()) return;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 250);
+    return () => clearInterval(timer);
+  }, [until]);
+  return Math.max(0, Math.ceil((until - now) / 1000));
 }
 
 // Última mensagem própria editável (seta para cima).

@@ -8,7 +8,7 @@ import { recentEmoji } from '../lib/emoji.js';
 import {
   copyText, deleteMessage, editMessage, isUserMessage, markUnread, messageLink, pinMessage, toggleReaction, unpinMessage,
 } from '../lib/messages.js';
-import { displayName, formatDateTime, formatMessageTime, formatTime } from '../lib/util.js';
+import { formatDateTime, formatMessageTime, formatTime } from '../lib/util.js';
 import MessageAttachments from './Attachments.jsx';
 import Avatar from './Avatar.jsx';
 import EmojiPicker from './EmojiPicker.jsx';
@@ -20,6 +20,7 @@ export function Content({ text, ...ctx }) {
 }
 
 const markdownProps = (ctx) => ({
+  nameOf: ctx.nameOf,
   usersByName: ctx.usersByName,
   channelsByName: ctx.channelsByName,
   guildId: ctx.channel.guild_id,
@@ -39,10 +40,27 @@ function durationText(ms) {
 
 const Time = ({ iso }) => <span className="timestamp" title={formatDateTime(iso)}>{formatMessageTime(iso)}</span>;
 
+// Mensagens de boas-vindas do Discord (tipo 7); a escolhida depende do instante da mensagem.
+const WELCOME = [
+  (u) => <>{u} entrou na festa.</>,
+  (u) => <>{u} está aqui.</>,
+  (u) => <>Boas-vindas, {u}. Esperamos que você tenha trazido pizza.</>,
+  (u) => <>Um {u} selvagem apareceu.</>,
+  (u) => <>{u} acabou de chegar.</>,
+  (u) => <>{u} acabou de deslizar para dentro do servidor.</>,
+  (u) => <>{u} acabou de aparecer!</>,
+  (u) => <>Boas-vindas, {u}. Diga oi!</>,
+  (u) => <>{u} pulou para dentro do servidor.</>,
+  (u) => <>Todos deem boas-vindas a {u}!</>,
+  (u) => <>Que bom que você está aqui, {u}.</>,
+  (u) => <>Bom te ver, {u}.</>,
+  (u) => <>Oba, você chegou, {u}!</>,
+];
+
 // --- mensagens de sistema (chamada, grupo, fixar) ---
 
 function SystemMessage({ message: m, ctx }) {
-  const name = (user) => <button className="author" onClick={(e) => ctx.onPopout(user.id, e)}>{displayName(ctx.users[user.id] ?? user)}</button>;
+  const name = (user) => <button className="author" onClick={(e) => ctx.onPopout(user.id, e)}>{ctx.nameOf(user.id, user)}</button>;
   const actor = name(m.author);
   let icon;
   let tone = '';
@@ -68,6 +86,10 @@ function SystemMessage({ message: m, ctx }) {
   } else if (m.type === 4) {
     icon = <Pencil size={18} />;
     text = m.content ? <>{actor} alterou o nome do canal: <b>{m.content}</b></> : <>{actor} removeu o nome do grupo.</>;
+  } else if (m.type === 7) {
+    tone = 'join';
+    icon = <ArrowRight size={18} />;
+    text = WELCOME[new Date(m.timestamp).getTime() % WELCOME.length](actor);
   } else if (m.type === 6) {
     icon = <Pin size={18} />;
     text = (
@@ -150,7 +172,7 @@ function Reactions({ message, ctx }) {
   return (
     <div className="reactions">
       {message.reactions.map((r) => {
-        const names = r.user_ids.map((id) => displayName(ctx.users[id])).join(', ');
+        const names = r.user_ids.map((id) => ctx.nameOf(id)).join(', ');
         return (
           <button
             key={r.emoji}
@@ -163,9 +185,11 @@ function Reactions({ message, ctx }) {
           </button>
         );
       })}
-      <button className="reaction add" aria-label="Adicionar reação" title="Adicionar reação" onClick={(e) => ctx.openPicker(message, e.currentTarget.getBoundingClientRect())}>
-        <SmilePlus size={16} />
-      </button>
+      {ctx.canReact && (
+        <button className="reaction add" aria-label="Adicionar reação" title="Adicionar reação" onClick={(e) => ctx.openPicker(message, e.currentTarget.getBoundingClientRect())}>
+          <SmilePlus size={16} />
+        </button>
+      )}
     </div>
   );
 }
@@ -181,7 +205,7 @@ function ReplyPreview({ message, ctx }) {
       <span className="reply-spine" />
       <Avatar user={author} size={16} />
       <button className="reply-author" style={{ color: ctx.colorOf(ref.author.id) }} onClick={(e) => ctx.onPopout(ref.author.id, e)}>
-        {message.reply_ping ? '@' : ''}{displayName(author)}
+        {message.reply_ping ? '@' : ''}{ctx.nameOf(ref.author.id, author)}
       </button>
       <button className="reply-content" onClick={() => ctx.onJump(ref.id)}>
         {ref.content ? <InlineMarkdown text={ref.content} {...markdownProps(ctx)} /> : <i>Clique para ver o anexo</i>}
@@ -194,7 +218,7 @@ function ReplyPreview({ message, ctx }) {
 export function messageMenuItems(message, ctx, anchorRect) {
   const own = message.author.id === ctx.me.id;
   return [
-    {
+    ctx.canReact && {
       custom: (close) => (
         <div className="menu-reactions">
           {recentEmoji().slice(0, 4).map((emoji) => (
@@ -203,7 +227,7 @@ export function messageMenuItems(message, ctx, anchorRect) {
         </div>
       ),
     },
-    { label: 'Adicionar reação', icon: SmilePlus, onClick: () => ctx.openPicker(message, anchorRect) },
+    ctx.canReact && { label: 'Adicionar reação', icon: SmilePlus, onClick: () => ctx.openPicker(message, anchorRect) },
     own && { label: 'Editar mensagem', icon: Pencil, onClick: () => ctx.onEdit(message.id) },
     ctx.canPin && (message.pinned
       ? { label: 'Desafixar mensagem', icon: PinOff, onClick: () => unpinMessage(message) }
@@ -230,7 +254,7 @@ export default function Message({ message: m, grouped, ctx }) {
   const lower = m.content.toLowerCase();
   const mentioned = (m.reply_ping && m.referenced_message?.author.id === ctx.me.id)
     || lower.includes(`@${ctx.me.username.toLowerCase()}`)
-    || (!!ctx.channel.guild_id && /(^|[^\w.])@(everyone|here)(?![\w.])/.test(lower));
+    || !!m.mention_everyone; // @everyone/@here só destacam se o autor tinha permissão
 
   const openMore = (rect, side = 'left') =>
     openMenu({ rect, side, width: 220, owner: `message-${m.id}`, items: messageMenuItems(m, ctx, rect) });
@@ -276,14 +300,14 @@ export default function Message({ message: m, grouped, ctx }) {
         <div className="message-body">
           {ctx.compact ? (
             <>
-              <button className="author" style={{ color: ctx.colorOf(m.author.id) }} onClick={(e) => ctx.onPopout(m.author.id, e)}>{displayName(author)}</button>
+              <button className="author" style={{ color: ctx.colorOf(m.author.id) }} onClick={(e) => ctx.onPopout(m.author.id, e)}>{ctx.nameOf(m.author.id, author)}</button>
               {body}
             </>
           ) : (
             <>
               {showHeader && (
                 <div className="message-meta">
-                  <button className="author" style={{ color: ctx.colorOf(m.author.id) }} onClick={(e) => ctx.onPopout(m.author.id, e)}>{displayName(author)}</button>
+                  <button className="author" style={{ color: ctx.colorOf(m.author.id) }} onClick={(e) => ctx.onPopout(m.author.id, e)}>{ctx.nameOf(m.author.id, author)}</button>
                   <Time iso={m.timestamp} />
                 </div>
               )}
@@ -297,9 +321,11 @@ export default function Message({ message: m, grouped, ctx }) {
 
       {!editing && (
         <div className="message-toolbar">
-          <button aria-label="Adicionar reação" title="Adicionar reação" onClick={(e) => ctx.openPicker(m, e.currentTarget.getBoundingClientRect())}>
-            <SmilePlus size={18} />
-          </button>
+          {ctx.canReact && (
+            <button aria-label="Adicionar reação" title="Adicionar reação" onClick={(e) => ctx.openPicker(m, e.currentTarget.getBoundingClientRect())}>
+              <SmilePlus size={18} />
+            </button>
+          )}
           {own ? (
             <button aria-label="Editar" title="Editar" onClick={() => ctx.onEdit(m.id)}><Pencil size={18} /></button>
           ) : ctx.canSend && (

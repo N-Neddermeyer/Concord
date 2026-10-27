@@ -44,3 +44,6 @@ export function alpha(hex, a) {
   const n = parseInt(hex.slice(1), 16);
   return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${a})`;
 }
+
+// Instante (ISO) embutido num Snowflake: 42 bits de milissegundos desde 2015-01-01.
+export const snowflakeTime = (id) => new Date(Number((BigInt(id) >> 22n) + 1420070400000n)).toISOString();

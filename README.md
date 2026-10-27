@@ -79,13 +79,31 @@ não libera esses dispositivos (exige HTTPS); use o app desktop.
   `CALL_CREATE`/`CALL_UPDATE`/`CALL_DELETE`, `POST /channels/:id/call/ring` e `/call/stop-ringing`.
 - **Servidores**: criar (com ícone) / entrar por convite, menu do servidor, categorias recolhíveis,
   canais de texto e voz, tópico do canal, não lidas e menções, lista de membros agrupada por cargo.
+  Banner no topo da lista de canais e mensagem aleatória de boas-vindas (tipo 7) no canal de sistema.
+- **Categorias e canais**: criar categoria, criar canal dentro dela (o canal nasce sincronizado com
+  as permissões da categoria), "Canal privado" / "Categoria privada" com a escolha de membros e cargos,
+  arrastar para reordenar canais e categorias (e servidores na barra da esquerda, salvo na conta),
+  clique direito em canal, categoria e área vazia, cadeado nos privados e alerta nos com restrição de idade.
+- **Permissões por canal (overwrites)**: mesmo cálculo do Discord (@everyone → cargos → membro;
+  sem "Ver canal", nada vale). Quem perde acesso deixa de receber o canal e as mensagens na hora
+  (`CHANNEL_CREATE`/`CHANNEL_DELETE` só para quem ganhou ou perdeu). Tela "Permissões" com
+  sincronizar com a categoria, canal privado e permissões avançadas (✗ / ⁄ / ✓).
+- **Modo lento e restrição de idade**: modo lento de 5 s a 6 h (contador no compositor; quem gerencia
+  o canal ou as mensagens não espera; o servidor responde 429 com `retry_after`) e canal com
+  restrição de idade com a tela de confirmação.
+- **Apelidos**: "Editar perfil do servidor" no menu do servidor, "Alterar apelido" no clique direito
+  do membro (Alterar apelido / Gerenciar apelidos). O apelido aparece nas mensagens, menções, lista
+  de membros, voz e notificações.
 - **Configurações de usuário**: Minha conta (nome de usuário, senha), Perfis (nome exibido, avatar,
   cor do banner, sobre mim, com prévia), Aparência (claro/escuro/ônix, compacto, fonte, zoom),
   Voz e vídeo (dispositivos, volume, teste de microfone, sensibilidade, processamento),
   Notificações, Atalhos de teclado, Sair.
-- **Configurações do servidor**: Visão geral, Cargos (cor, exibir separadamente, permissões,
-  membros, ordem), Membros (cargos, expulsar, banir), Convites, Banimentos, Excluir servidor.
-- **Configurações do canal**: nome, tópico, excluir.
+- **Configurações do servidor**: Visão geral (ícone, nome, canal de mensagens do sistema, boas-vindas,
+  banner), Cargos (cor, exibir separadamente, permissões, membros, ordem), Registro de auditoria
+  (filtros por usuário e ação, detalhes de cada mudança, atualiza em tempo real), Membros (cargos,
+  apelido, expulsar, banir), Convites, Banimentos, Excluir servidor.
+- **Configurações do canal e da categoria**: nome, tópico, modo lento, restrição de idade,
+  Permissões, excluir.
 - **Status**: Online, Ausente, Não perturbe (silencia notificações), Invisível.
 - **Voz**: mudo, ensurdecer, detecção de voz com anel verde, sons de entrar/sair.
 - **Vídeo e tela**: câmera e compartilhamento de tela na chamada de DM/grupo e no canal de voz do
@@ -137,7 +155,9 @@ Só imagem, vídeo e áudio abrem no navegador; os demais tipos são sempre serv
 - Sem logo própria por enquanto: o botão de início usa um ícone genérico e a bandeja um círculo.
 - Voz P2P em malha: boa para poucas pessoas na mesma rede. Para mais gente, troque por um SFU (LiveKit, mediasoup).
 - Sem STUN/TURN: funciona em `localhost` e na rede local, não pela internet.
-- Sem permissões por canal (overwrites) nem emojis personalizados. Blocos de código sem cores de sintaxe.
+- Sem emojis personalizados. Blocos de código sem cores de sintaxe.
+- Permissões de voz além de "Conectar" (falar, vídeo, mutar outros) não existem: a mídia é P2P e
+  o servidor não teria como impor. Convites são do servidor, não de um canal.
 - Vídeo em malha: cada um envia sua câmera/tela para cada participante, então pesa com muita gente.
 - Sem TLS: tráfego em `http`/`ws` e mensagens gravadas em texto puro no banco.
 - O servidor escuta só em `127.0.0.1` (`npm run start:lan` escuta na rede); no navegador o microfone

@@ -54,3 +54,6 @@ export const closePopout = () => set({ popout: null });
 // Menu suspenso: items = [{ label, onClick, danger, color, separator }].
 export const openMenu = (menu) => set({ menu, popout: null });
 export const closeMenu = () => set({ menu: null });
+
+// Retângulo de um ponto (clique direito), para ancorar o menu no cursor.
+export const pointRect = (e) => ({ left: e.clientX, right: e.clientX, top: e.clientY, bottom: e.clientY, width: 0, height: 0 });

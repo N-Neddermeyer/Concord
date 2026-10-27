@@ -17,6 +17,7 @@ import TitleBar from './components/TitleBar.jsx';
 import UserPanel, { VoicePanel } from './components/UserPanel.jsx';
 import VoiceChannelView from './components/VoiceChannelView.jsx';
 import { token } from './lib/api.js';
+import { firstTextChannel } from './lib/channels.js';
 import { closeAllModals, hasOpenModal, openModal } from './lib/dialogs.js';
 import { gateway } from './lib/gateway.js';
 import { HOME, dispatch, privateChannelName, useStore } from './lib/store.js';
@@ -113,11 +114,7 @@ function Main({ onLogout, onToken }) {
   // Canal aberto: o escolhido por último (texto ou voz), se ainda existir; senão o primeiro de texto.
   let channelId = nav.channels[guildId] ?? null;
   if (channelId && !channels[channelId]) channelId = null;
-  if (!isHome && !channelId) {
-    channelId = Object.values(channels)
-      .filter((c) => c.guild_id === guildId && c.type === 0)
-      .sort((a, b) => a.position - b.position)[0]?.id ?? null;
-  }
+  if (!isHome && !channelId) channelId = firstTextChannel(channels, guildId)?.id ?? null;
   if (!isHome && ![0, 2].includes(channels[channelId]?.type)) channelId = null;
 
   const channel = channels[channelId];
@@ -158,7 +155,7 @@ function Main({ onLogout, onToken }) {
 
       {layer?.type === 'user' && <UserSettings section={layer.section} onLogout={onLogout} onToken={onToken} />}
       {layer?.type === 'guild' && <GuildSettings guildId={layer.guildId} section={layer.section} />}
-      {layer?.type === 'channel' && <ChannelSettings channelId={layer.channelId} />}
+      {layer?.type === 'channel' && <ChannelSettings channelId={layer.channelId} section={layer.section} />}
       <IncomingCall />
       <DialogHost />
     </div>

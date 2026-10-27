@@ -16,6 +16,6 @@ export async function api(path, { method = 'GET', body } = {}) {
 
   const res = await fetch(`/api${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
   const data = res.status === 204 ? null : await res.json().catch(() => null);
-  if (!res.ok) throw new Error(data?.message ?? `HTTP ${res.status}`);
+  if (!res.ok) throw Object.assign(new Error(data?.message ?? `HTTP ${res.status}`), { status: res.status, data });
   return data;
 }

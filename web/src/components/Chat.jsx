@@ -1,13 +1,13 @@
-import { AtSign, File, FileCode, FileImage, FileText, Hash, Phone, Pin, UserPlus, Users, Video, X } from 'lucide-react';
+import { AtSign, File, FileCode, FileImage, FileText, Phone, Pin, Timer, TriangleAlert, UserPlus, Users, Video, X } from 'lucide-react';
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../lib/api.js';
 import { useCallLayout } from '../lib/callLayout.js';
 import { acceptCall, startCall, startVideoCall } from '../lib/calls.js';
 import { openPopout, showError, useDialogs } from '../lib/dialogs.js';
 import { isUserMessage } from '../lib/messages.js';
-import { P, has, memberColor, permissionsFor } from '../lib/permissions.js';
+import { P, channelPermissionsFor, has, memberColor } from '../lib/permissions.js';
 import { useSettings } from '../lib/settings.js';
-import { REL, dispatch, dmRecipient, isPrivate, navigate, privateChannelName, useStore } from '../lib/store.js';
+import { HOME, REL, dispatch, dmRecipient, isPrivate, memberName, navigate, privateChannelName, useStore } from '../lib/store.js';
 import { useTypingUsers } from '../lib/typing.js';
 import { formatSize } from '../lib/upload.js';
 import { STATUS_LABELS, compareIds, displayName, formatDate } from '../lib/util.js';
@@ -15,7 +15,8 @@ import { useVoice } from '../lib/voice.js';
 import AddToDmPopout from './AddToDmPopout.jsx';
 import Avatar, { GroupIcon } from './Avatar.jsx';
 import CallView from './CallView.jsx';
-import Composer, { lastOwnMessage } from './Composer.jsx';
+import { ChannelIcon } from './ChannelSidebar.jsx';
+import Composer, { lastOwnMessage, useCooldown } from './Composer.jsx';
 import Message, { openReactionPicker } from './Message.jsx';
 import PinsPopout from './PinsPopout.jsx';
 
@@ -80,7 +81,8 @@ export default function Chat({ channelId }) {
   const relationships = useStore((s) => s.relationships);
   const presences = useStore((s) => s.presences);
   const showMembers = useStore((s) => s.showMembers);
-  const perms = useStore((s) => (guildId ? permissionsFor(s, guildId) : 0));
+  const perms = useStore((s) => (guildId ? channelPermissionsFor(s, channelId) : 0));
+  const nsfwAllowed = useStore((s) => !!s.nsfwAllowed[channelId]);
   const readState = useStore((s) => s.readStates[channelId]);
   const manualUnread = useStore((s) => !!s.manualUnread[channelId]);
   const jump = useStore((s) => (s.jump?.channelId === channelId ? s.jump : null));
@@ -116,6 +118,12 @@ export default function Chat({ channelId }) {
   const blocked = isDm && relationships[recipient.id]?.type === REL.BLOCKED;
   const canSend = isPrivateChannel ? !blocked : has(perms, P.SEND_MESSAGES);
   const canManage = has(perms, P.MANAGE_MESSAGES);
+  const canAttach = isPrivateChannel || has(perms, P.ATTACH_FILES);
+  const canReact = isPrivateChannel || has(perms, P.ADD_REACTIONS);
+  // Modo lento não vale para quem gerencia o canal ou as mensagens.
+  const slowmode = !isPrivateChannel && !has(perms, P.MANAGE_MESSAGES) && !has(perms, P.MANAGE_CHANNELS) ? channel.rate_limit_per_user ?? 0 : 0;
+  const nameOf = (userId, fallback) => memberName(state, guildId, userId, fallback);
+  const ageGate = !!channel.nsfw && !nsfwAllowed;
   const canPin = isPrivateChannel || canManage;
   const title = isPrivateChannel ? privateChannelName(state, channel) : channel.name;
 
@@ -216,7 +224,7 @@ export default function Chat({ channelId }) {
 
   // Arrastar arquivos sobre o chat: sobreposição "Enviar para #canal"; Shift ao soltar envia direto.
   const onDragEnter = (e) => {
-    if (!canSend || !e.dataTransfer.types.includes('Files')) return;
+    if (!canSend || !canAttach || ageGate || !e.dataTransfer.types.includes('Files')) return;
     e.preventDefault();
     dragDepth.current++;
     setDragging(true);
@@ -256,6 +264,8 @@ export default function Chat({ channelId }) {
     canSend,
     canManage: canManage,
     canPin,
+    canReact,
+    nameOf,
     editingId,
     highlightId,
     menuFor: menuOwner?.startsWith('message-') ? menuOwner.slice(8) : null,
@@ -304,7 +314,7 @@ export default function Chat({ channelId }) {
         )}
         {!isPrivateChannel && (
           <>
-            <Hash size={24} className="header-icon" />
+            <ChannelIcon channel={channel} size={24} className="header-icon" />
             <h1>{title}</h1>
             {channel.topic && <><span className="header-divider" /><span className="header-topic" title={channel.topic}>{channel.topic}</span></>}
           </>
@@ -361,6 +371,7 @@ export default function Chat({ channelId }) {
 
       {isPrivateChannel && <CallView channel={channel} />}
 
+      {ageGate ? <AgeGate channel={channel} /> : (<>
       <div className={`messages ${messageDisplay}`} ref={scroller} onScroll={onScroll}>
         {entry && !entry.hasMore && (
           <div className="channel-start">
@@ -381,7 +392,7 @@ export default function Chat({ channelId }) {
             )}
             {!isPrivateChannel && (
               <>
-                <div className="start-icon"><Hash size={44} /></div>
+                <div className="start-icon"><ChannelIcon channel={channel} size={44} className="" /></div>
                 <h2>Boas-vindas a #{channel.name}!</h2>
                 <p>Este é o começo do canal #{channel.name}.</p>
               </>
@@ -416,7 +427,7 @@ export default function Chat({ channelId }) {
       <div className="composer">
         {replyTo && (
           <div className="reply-bar">
-            <span>Respondendo a <b>{displayName(users[replyTo.message.author.id] ?? replyTo.message.author)}</b></span>
+            <span>Respondendo a <b>{nameOf(replyTo.message.author.id, replyTo.message.author)}</b></span>
             {replyTo.message.author.id !== me.id && (
               <button
                 className={`reply-ping${replyTo.ping ? ' on' : ''}`}
@@ -445,22 +456,58 @@ export default function Chat({ channelId }) {
             onUpload={setUpload}
             apiRef={composerApi}
             textareaRef={composer}
+            canAttach={canAttach}
+            slowmode={slowmode}
           />
         ) : (
           <div className="composer-box disabled">
             {blocked ? 'Você não pode enviar mensagens para um usuário que você bloqueou.' : 'Você não tem permissão para enviar mensagens neste canal.'}
           </div>
         )}
-        <TypingIndicator ids={typingIds} users={users} />
+        <div className="composer-footer">
+          <TypingIndicator ids={typingIds} nameOf={nameOf} />
+          {!isPrivateChannel && channel.rate_limit_per_user > 0 && canSend && <SlowmodeIndicator channel={channel} immune={!slowmode} />}
+        </div>
       </div>
+      </>)}
     </main>
   );
 }
 
+// Portão de idade dos canais NSFW (com restrição de idade), como no Discord.
+function AgeGate({ channel }) {
+  return (
+    <div className="age-gate">
+      <div className="age-gate-icon"><TriangleAlert size={56} /></div>
+      <h2>Canal com restrição de idade</h2>
+      <p>Este canal contém material adulto marcado com restrição de idade. Deseja continuar?</p>
+      <div className="row">
+        <button className="button secondary" onClick={() => navigate(HOME)}>Não</button>
+        <button className="button brand" onClick={() => dispatch({ type: 'NSFW_ALLOW', d: channel.id })}>Continuar</button>
+      </div>
+    </div>
+  );
+}
+
+// Ícone de ampulheta à direita, embaixo do compositor; mostra a contagem depois de enviar.
+function SlowmodeIndicator({ channel, immune }) {
+  const left = useCooldown(channel.id);
+  const seconds = channel.rate_limit_per_user;
+  const label = seconds < 60 ? `${seconds} segundos` : seconds < 3600 ? `${seconds / 60} minutos` : `${seconds / 3600} horas`;
+  const title = immune ? 'O modo lento está ativado, mas você está imune.' : `Modo lento ativado. Os membros só podem enviar uma mensagem a cada ${label}.`;
+  return (
+    <div className="slowmode-indicator" title={title}>
+      {left > 0 && <span>{`${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`}</span>}
+      <Timer size={16} />
+      {left === 0 && <span>Modo lento ativado</span>}
+    </div>
+  );
+}
+
 // "Fulano está digitando…" embaixo do compositor, com os três pontos animados.
-function TypingIndicator({ ids, users }) {
+function TypingIndicator({ ids, nameOf }) {
   if (!ids.length) return <div className="typing-indicator" />;
-  const names = ids.map((id) => <b key={id}>{displayName(users[id])}</b>);
+  const names = ids.map((id) => <b key={id}>{nameOf(id)}</b>);
   const text = ids.length === 1 ? <>{names[0]} está digitando…</>
     : ids.length === 2 ? <>{names[0]} e {names[1]} estão digitando…</>
     : ids.length === 3 ? <>{names[0]}, {names[1]} e {names[2]} estão digitando…</>

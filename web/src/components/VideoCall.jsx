@@ -8,8 +8,7 @@ import {
 } from '../lib/callLayout.js';
 import { openModal } from '../lib/dialogs.js';
 import { native } from '../lib/native.js';
-import { useStore } from '../lib/store.js';
-import { displayName } from '../lib/util.js';
+import { memberName, useStore } from '../lib/store.js';
 import { useVoice, voice } from '../lib/voice.js';
 import Avatar from './Avatar.jsx';
 import { Modal } from './Modal.jsx';
@@ -50,6 +49,7 @@ export function useVideoTiles(channelId, userIds) {
 export function VideoTile({ tile, focused = false, fullscreen = false, onFocus, onFullscreen, children }) {
   const me = useStore((s) => s.user.id);
   const speaking = useStore((s) => !!s.speaking[tile.user.id]);
+  const name = useStore((s) => memberName(s, tile.state?.guild_id, tile.user.id, tile.user)); // apelido no canal de voz
   const { user, state, kind, track } = tile;
   const isScreen = kind === 'screen';
   const showVideo = !!track;
@@ -79,7 +79,7 @@ export function VideoTile({ tile, focused = false, fullscreen = false, onFocus, 
       <div className="video-tile-label">
         {isScreen && <span className="live-pill">Ao vivo</span>}
         {!isScreen && state?.self_deaf ? <HeadphoneOff size={14} /> : !isScreen && state?.self_mute ? <MicOff size={14} /> : null}
-        <span>{displayName(user)}</span>
+        <span>{name}</span>
       </div>
       <button
         className="video-tile-fullscreen"

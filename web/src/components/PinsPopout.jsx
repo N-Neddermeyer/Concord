@@ -2,8 +2,8 @@ import { Pin, X } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { api } from '../lib/api.js';
 import { unpinMessage } from '../lib/messages.js';
-import { HOME, jumpToMessage, useStore } from '../lib/store.js';
-import { displayName, formatMessageTime } from '../lib/util.js';
+import { HOME, jumpToMessage, memberName, useStore } from '../lib/store.js';
+import { formatMessageTime } from '../lib/util.js';
 import Avatar from './Avatar.jsx';
 import { Content } from './Message.jsx';
 
@@ -11,6 +11,8 @@ import { Content } from './Message.jsx';
 export default function PinsPopout({ channel, canPin, close }) {
   const version = useStore((s) => s.pinsUpdated[channel.id]);
   const users = useStore((s) => s.users);
+  const state = useStore((s) => s);
+  const nameOf = (id, fallback) => memberName(state, channel.guild_id, id, fallback);
   const [pins, setPins] = useState(null);
   const [error, setError] = useState(null);
   const usersByName = useMemo(() => new Map(Object.values(users).map((u) => [u.username.toLowerCase(), u])), [users]);
@@ -50,11 +52,11 @@ export default function PinsPopout({ channel, canPin, close }) {
               <Avatar user={author} size={40} />
               <div className="pin-body">
                 <div className="message-meta">
-                  <span className="author">{displayName(author)}</span>
+                  <span className="author">{nameOf(m.author.id, author)}</span>
                   <span className="timestamp">{formatMessageTime(m.timestamp)}</span>
                 </div>
                 <div className="content">
-                  <Content text={m.content} usersByName={usersByName} onMention={() => {}} />
+                  <Content text={m.content} usersByName={usersByName} nameOf={nameOf} guildId={channel.guild_id} onMention={() => {}} />
                   {m.edited_timestamp && <span className="edited"> (editado)</span>}
                 </div>
               </div>
