@@ -1,54 +1,31 @@
 import {
-  ArrowLeft, ArrowRight, Copy, CornerUpLeft, Ellipsis, IdCard, Link, MessageSquareDot, Pencil, Phone, PhoneMissed, Pin,
+  ArrowLeft, ArrowRight, Copy, CornerUpLeft, Ellipsis, IdCard, Image as ImageIcon, Link, MessageSquareDot, Pencil, Phone, PhoneMissed, Pin,
   PinOff, Reply, SmilePlus, Trash2,
 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { openMenu, openPopout, showError } from '../lib/dialogs.js';
 import { recentEmoji } from '../lib/emoji.js';
 import {
-  copyText, deleteMessage, editMessage, isUserMessage, markUnread, messageLink, parseMessageLink, pinMessage, toggleReaction,
-  unpinMessage,
+  copyText, deleteMessage, editMessage, isUserMessage, markUnread, messageLink, pinMessage, toggleReaction, unpinMessage,
 } from '../lib/messages.js';
-import { HOME, jumpToMessage } from '../lib/store.js';
 import { displayName, formatDateTime, formatMessageTime, formatTime } from '../lib/util.js';
+import MessageAttachments from './Attachments.jsx';
 import Avatar from './Avatar.jsx';
 import EmojiPicker from './EmojiPicker.jsx';
+import Markdown, { InlineMarkdown, isJumbo } from './Markdown.jsx';
 
-const TOKEN = /(https?:\/\/[^\s<]+[^\s<.,;:!?)"'])|(@[\w.]{2,32})/g;
-
-// Texto da mensagem com links clicáveis (links de mensagem do app pulam até ela) e menções destacadas.
-export function Content({ text, usersByName, onMention }) {
-  const parts = [];
-  let last = 0;
-  for (const match of text.matchAll(TOKEN)) {
-    if (match.index > last) parts.push(text.slice(last, match.index));
-    if (match[1]) {
-      const internal = parseMessageLink(match[1]);
-      parts.push(
-        <a
-          key={match.index}
-          href={match[1]}
-          target="_blank"
-          rel="noreferrer"
-          onClick={internal ? (e) => {
-            e.preventDefault();
-            jumpToMessage(internal.guildId === '@me' ? HOME : internal.guildId, internal.channelId, internal.messageId);
-          } : undefined}
-        >
-          {match[1]}
-        </a>,
-      );
-    } else {
-      const user = usersByName.get(match[2].slice(1).toLowerCase());
-      parts.push(user ? (
-        <button key={match.index} className="mention" onClick={(e) => onMention(user.id, e)}>@{displayName(user)}</button>
-      ) : match[2]);
-    }
-    last = match.index + match[0].length;
-  }
-  if (last < text.length) parts.push(text.slice(last));
-  return <>{parts}</>;
+// Texto da mensagem com markdown, links (os de mensagem do app pulam até ela) e menções.
+export function Content({ text, ...ctx }) {
+  return <Markdown text={text} {...ctx} />;
 }
+
+const markdownProps = (ctx) => ({
+  usersByName: ctx.usersByName,
+  channelsByName: ctx.channelsByName,
+  guildId: ctx.channel.guild_id,
+  onMention: ctx.onPopout,
+  onChannel: ctx.onChannel,
+});
 
 // "alguns segundos", "um minuto", "5 minutos", "uma hora"… como no Discord.
 function durationText(ms) {
@@ -125,7 +102,8 @@ function Editor({ message, onDone }) {
   const save = async () => {
     const content = value.trim();
     if (content === message.content) return onDone();
-    if (!content) {
+    // Com anexos, apagar o texto só remove o texto; sem anexos, é excluir a mensagem.
+    if (!content && !message.attachments?.length) {
       // Salvar vazio = excluir (com confirmação), como no Discord.
       if (await deleteMessage(message)) onDone();
       return;
@@ -205,7 +183,10 @@ function ReplyPreview({ message, ctx }) {
       <button className="reply-author" style={{ color: ctx.colorOf(ref.author.id) }} onClick={(e) => ctx.onPopout(ref.author.id, e)}>
         {message.reply_ping ? '@' : ''}{displayName(author)}
       </button>
-      <button className="reply-content" onClick={() => ctx.onJump(ref.id)}>{ref.content || 'Clique para ver o anexo'}</button>
+      <button className="reply-content" onClick={() => ctx.onJump(ref.id)}>
+        {ref.content ? <InlineMarkdown text={ref.content} {...markdownProps(ctx)} /> : <i>Clique para ver o anexo</i>}
+      </button>
+      {!!ref.attachments?.length && <ImageIcon size={16} className="reply-attachment-icon" />}
     </div>
   );
 }
@@ -246,17 +227,19 @@ export default function Message({ message: m, grouped, ctx }) {
   const editing = ctx.editingId === m.id;
   const isReply = !!m.message_reference;
   const showHeader = !grouped || isReply;
+  const lower = m.content.toLowerCase();
   const mentioned = (m.reply_ping && m.referenced_message?.author.id === ctx.me.id)
-    || m.content.toLowerCase().includes(`@${ctx.me.username.toLowerCase()}`);
+    || lower.includes(`@${ctx.me.username.toLowerCase()}`)
+    || (!!ctx.channel.guild_id && /(^|[^\w.])@(everyone|here)(?![\w.])/.test(lower));
 
   const openMore = (rect, side = 'left') =>
     openMenu({ rect, side, width: 220, owner: `message-${m.id}`, items: messageMenuItems(m, ctx, rect) });
 
   const body = editing
     ? <Editor message={m} onDone={() => ctx.onEdit(null)} />
-    : (
-      <div className="content">
-        <Content text={m.content} usersByName={ctx.usersByName} onMention={ctx.onPopout} />
+    : (m.content || m.edited_timestamp) && (
+      <div className={`content${isJumbo(m.content) ? ' jumbo' : ''}`}>
+        <Markdown text={m.content} {...markdownProps(ctx)} />
         {m.edited_timestamp && <span className="edited" title={formatDateTime(m.edited_timestamp)}> (editado)</span>}
       </div>
     );
@@ -307,6 +290,7 @@ export default function Message({ message: m, grouped, ctx }) {
               {body}
             </>
           )}
+          <MessageAttachments message={m} />
           <Reactions message={m} ctx={ctx} />
         </div>
       </div>

@@ -22,6 +22,7 @@ const initialState = () => ({
   voiceStates: {}, // userId -> { guild_id, channel_id, user_id, self_mute, self_deaf }
   calls: {}, // dmChannelId -> { channel_id, message_id, ringing: [userId] } (chamadas em DM)
   speaking: {}, // userId -> true
+  typing: {}, // channelId -> { userId -> instante (ms) em que o aviso expira }
   messages: {}, // channelId -> { list, hasMore }
   pinsUpdated: {}, // channelId -> último CHANNEL_PINS_UPDATE (o popout de fixadas recarrega)
   manualUnread: {}, // channelId -> true: "marcar como não lida" (não confirma leitura sozinho)
@@ -168,8 +169,14 @@ export const isPrivate = (channel) => channel?.type === 1 || channel?.type === 3
 const isMention = (s, m) => {
   if (m.referenced_message?.author.id === s.user.id && m.reply_ping) return true;
   const name = s.user.username.toLowerCase();
-  return m.content.toLowerCase().split(/\s+/).some((word) => word.replace(/[^\w.@]/g, '') === `@${name}`);
+  const channel = s.channels[m.channel_id];
+  return m.content.toLowerCase().split(/\s+/).some((word) => {
+    const token = word.replace(/[^\w.@]/g, '');
+    return token === `@${name}` || (!!channel?.guild_id && (token === '@everyone' || token === '@here'));
+  });
 };
+
+const TYPING_MS = 10_000;
 
 function reduce(s, { type, d }) {
   switch (type) {
@@ -335,6 +342,10 @@ function reduce(s, { type, d }) {
       if (entry && !entry.list.some((m) => m.id === d.id)) {
         next.messages = { ...s.messages, [d.channel_id]: { ...entry, list: [...entry.list, d] } };
       }
+      // Quem enviou parou de digitar.
+      if (s.typing[channel.id]?.[d.author.id]) {
+        next.typing = { ...s.typing, [channel.id]: without(s.typing[channel.id], d.author.id) };
+      }
       if (d.author.id === s.user.id) {
         next.readStates = { ...s.readStates, [channel.id]: d.id };
       } else if ((d.type === 0 || d.type === 19) && s.relationships[d.author.id]?.type !== REL.BLOCKED && (isPrivate(channel) || isMention(s, d))) {
@@ -370,6 +381,19 @@ function reduce(s, { type, d }) {
         return { ...m, reactions };
       });
       return { ...s, messages: { ...s.messages, [d.channel_id]: { ...entry, list } } };
+    }
+
+    case 'TYPING_START': {
+      if (d.user_id === s.user.id || !s.channels[d.channel_id]) return s;
+      const expires = Date.now() + TYPING_MS;
+      return { ...s, typing: { ...s.typing, [d.channel_id]: { ...s.typing[d.channel_id], [d.user_id]: expires } } };
+    }
+
+    // Disparado pelo timer de lib/typing.js; ignora se chegou um aviso mais novo nesse meio-tempo.
+    case 'TYPING_STOP': {
+      const current = s.typing[d.channelId]?.[d.userId];
+      if (!current || current > Date.now()) return s;
+      return { ...s, typing: { ...s.typing, [d.channelId]: without(s.typing[d.channelId], d.userId) } };
     }
 
     case 'MESSAGE_DELETE': {

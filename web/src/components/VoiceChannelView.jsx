@@ -1,30 +1,40 @@
 import { Volume2 } from 'lucide-react';
+import { useEffect } from 'react';
+import { LAYOUT, leaveFullScreen, useCallLayout, useIdle } from '../lib/callLayout.js';
 import { useStore } from '../lib/store.js';
 import { useVoice, voice } from '../lib/voice.js';
 import Avatar from './Avatar.jsx';
-import { CallControls, VideoGrid, useVideoTiles } from './VideoCall.jsx';
+import { CallBar, CallControls, FullscreenButton, VideoGrid, useVideoTiles } from './VideoCall.jsx';
 
 // Canal de voz aberto na área principal, como no Discord: a grade com quem está nele
-// (câmera, avatar ou tela transmitida) e os controles embaixo.
+// (câmera, avatar ou tela transmitida), os controles embaixo e "Tela cheia" à direita.
 export default function VoiceChannelView({ channelId }) {
   const channel = useStore((s) => s.channels[channelId]);
   const voiceStates = useStore((s) => s.voiceStates);
   const users = useStore((s) => s.users);
   const session = useVoice();
+  const { layout } = useCallLayout(channelId);
   const presentIds = Object.values(voiceStates).filter((v) => v.channel_id === channelId).map((v) => v.user_id);
   const tiles = useVideoTiles(channelId, presentIds);
   const connected = session.channelId === channelId;
+  const fullscreen = layout === LAYOUT.FULL_SCREEN;
+  const [idle, idleHandlers] = useIdle(connected);
+
+  useEffect(() => {
+    if (!connected) leaveFullScreen(channelId);
+  }, [connected, channelId]);
+  useEffect(() => () => leaveFullScreen(channelId), [channelId]);
 
   return (
-    <main className="voice-view">
+    <main className={`voice-view${fullscreen ? ' layout-full-screen' : ''}${idle ? ' idle' : ''}`} {...idleHandlers}>
       <header className="voice-view-header">
         <Volume2 size={24} />
         <h1>{channel.name}</h1>
       </header>
       {connected ? (
         <>
-          <VideoGrid tiles={tiles} />
-          <CallControls deafen />
+          <VideoGrid channelId={channelId} tiles={tiles} />
+          <CallBar center={<CallControls deafen />} right={<FullscreenButton channelId={channelId} />} />
         </>
       ) : (
         <div className="voice-view-idle">

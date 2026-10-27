@@ -1,7 +1,12 @@
 import { randomBytes } from 'node:crypto';
-import { Router } from 'express';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import express, { Router } from 'express';
 import { hashPassword, newToken, verifyPassword } from './auth.js';
-import { CHANNEL_DM, CHANNEL_GROUP_DM, CHANNEL_TEXT, CHANNEL_VOICE, MSG, REL, db, loadMessages, messagePayload, privateUser, publicUser, q } from './db.js';
+import {
+  ATTACHMENTS_DIR, CHANNEL_DM, CHANNEL_GROUP_DM, CHANNEL_TEXT, CHANNEL_VOICE, MSG, REL, db, loadMessages, messagePayload, privateUser,
+  publicUser, q,
+} from './db.js';
 import {
   broadcastPresence,
   buildDmChannel,
@@ -36,6 +41,10 @@ const MAX_GROUP_SIZE = 10; // participantes de um grupo de DM, como no Discord
 const MAX_PINS = 50;
 const MAX_REACTION_KINDS = 20;
 const EMOJI = /^\p{Extended_Pictographic}[\p{Extended_Pictographic}\p{Emoji_Component}\u200d\ufe0f]*$/u;
+// Anexos: limites da conta gratuita do Discord.
+export const MAX_FILE_SIZE = 10 * 1024 * 1024;
+const MAX_ATTACHMENTS = 10;
+const CONTENT_TYPE = /^[\w.+-]+\/[\w.+-]+$/;
 
 const now = () => new Date().toISOString();
 
@@ -713,6 +722,104 @@ api.post('/invites/:code', (req, res) => {
   res.json(guild);
 });
 
+// --- digitando ---
+
+function canSendIn(req, channel) {
+  if (!channel.guild_id) return true;
+  req.params.guildId = channel.guild_id;
+  return has(loadGuild(req).perms, P.SEND_MESSAGES);
+}
+
+function isBlockedDm(req, channel) {
+  if (channel.type !== CHANNEL_DM) return false;
+  const other = dmRecipientIds(channel.id).find((id) => id !== req.user.id);
+  return q.relationship.get(req.user.id, other)?.type === REL.BLOCKED || q.relationship.get(other, req.user.id)?.type === REL.BLOCKED;
+}
+
+// Como no Discord: o cliente avisa a cada ~8 s enquanto digita e o aviso vale 10 s.
+api.post('/channels/:channelId/typing', (req, res) => {
+  const channel = loadMessageChannel(req);
+  if (!canSendIn(req, channel)) fail(403, 'Você não tem permissão para enviar mensagens neste canal.');
+  if (!isBlockedDm(req, channel)) {
+    dispatchToChannel(channel, 'TYPING_START', {
+      channel_id: channel.id, guild_id: channel.guild_id, user_id: req.user.id, timestamp: Math.floor(Date.now() / 1000),
+    });
+  }
+  res.status(204).end();
+});
+
+// --- anexos ---
+
+// Nome de arquivo como o Discord grava: espaços e símbolos viram "_".
+function safeFilename(raw) {
+  const name = String(raw ?? '').normalize('NFC').replace(/[^\p{L}\p{N}._-]+/gu, '_').replace(/^\.+/, '').slice(-100);
+  return name || 'arquivo';
+}
+
+const uploadDir = (key) => path.join(ATTACHMENTS_DIR, key);
+const removeUpload = (a) => rmSync(uploadDir(a.upload_key), { recursive: true, force: true });
+
+// Uploads que nunca viraram mensagem (aba fechada no meio do envio) somem depois de um dia.
+for (const a of q.staleUploads.all(new Date(Date.now() - 86_400_000).toISOString())) {
+  removeUpload(a);
+  q.deleteAttachment.run(a.id);
+}
+
+// Passo 1: reserva os uploads e devolve para onde enviar cada arquivo (mesmo fluxo do Discord).
+api.post('/channels/:channelId/attachments', (req, res) => {
+  const channel = loadMessageChannel(req);
+  if (!canSendIn(req, channel)) fail(403, 'Você não tem permissão para enviar mensagens neste canal.');
+  const files = Array.isArray(req.body?.files) ? req.body.files : [];
+  if (!files.length) fail(400, 'Nenhum arquivo.');
+  if (files.length > MAX_ATTACHMENTS) fail(400, `Você só pode enviar até ${MAX_ATTACHMENTS} arquivos de uma vez.`);
+  const created = now();
+  const attachments = files.map((f) => {
+    const size = Number(f?.file_size);
+    if (!Number.isInteger(size) || size < 0) fail(400, 'Tamanho de arquivo inválido.');
+    if (size > MAX_FILE_SIZE) fail(413, 'O tamanho máximo de arquivo é 10 MB.');
+    const key = randomBytes(16).toString('hex');
+    const filename = safeFilename(f.filename);
+    q.insertAttachment.run(snowflake(), channel.id, req.user.id, key, filename, size, created);
+    return { id: f.id ?? null, upload_url: `/api/uploads/${key}`, upload_filename: `${key}/${filename}` };
+  });
+  res.json({ attachments });
+});
+
+// Passo 2: PUT no upload_url com o arquivo no corpo.
+api.put('/uploads/:key', express.raw({ type: () => true, limit: MAX_FILE_SIZE }), (req, res) => {
+  const a = q.attachmentByKey.get(req.params.key);
+  if (!a || a.uploader_id !== req.user.id || a.message_id) fail(404, 'Upload não encontrado.');
+  const body = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+  const type = String(req.get('Content-Type') ?? '').split(';')[0].trim().toLowerCase();
+  mkdirSync(uploadDir(a.upload_key), { recursive: true });
+  writeFileSync(path.join(uploadDir(a.upload_key), 'file'), body); // o nome vai só no banco (pode mudar, ex.: SPOILER_)
+  q.markUploaded.run(body.length, CONTENT_TYPE.test(type) ? type : 'application/octet-stream', a.id);
+  res.status(204).end();
+});
+
+// Passo 3: a mensagem cita os uploads ({ filename, uploaded_filename, width, height }).
+function claimAttachments(req, channel) {
+  const list = req.body?.attachments;
+  if (!Array.isArray(list) || !list.length) return [];
+  if (list.length > MAX_ATTACHMENTS) fail(400, `Você só pode enviar até ${MAX_ATTACHMENTS} arquivos de uma vez.`);
+  const dimension = (v) => (Number.isInteger(v) && v > 0 && v <= 65535 ? v : null);
+  return list.map((item, position) => {
+    const a = q.attachmentByKey.get(String(item?.uploaded_filename ?? '').split('/')[0]);
+    if (!a || a.uploader_id !== req.user.id || a.channel_id !== channel.id || a.message_id || !a.uploaded) {
+      fail(400, 'Anexo inválido ou ainda não enviado.');
+    }
+    const visual = /^(image|video)\//.test(a.content_type ?? '');
+    return {
+      row: a,
+      // Pode renomear no envio (ex.: o prefixo SPOILER_).
+      filename: item.filename ? safeFilename(item.filename) : a.filename,
+      width: visual ? dimension(item.width) : null,
+      height: visual ? dimension(item.height) : null,
+      position,
+    };
+  });
+}
+
 // --- mensagens ---
 
 api.get('/channels/:channelId/messages', (req, res) => {
@@ -723,10 +830,11 @@ api.get('/channels/:channelId/messages', (req, res) => {
 });
 
 // Grava e distribui uma mensagem (normal, resposta ou de sistema) no canal.
-function postMessage(channel, author, { content = '', type = MSG.DEFAULT, reference_id = null, reply_ping = false, meta = null }) {
+function postMessage(channel, author, { content = '', type = MSG.DEFAULT, reference_id = null, reply_ping = false, meta = null, attachments = [] }) {
   const id = snowflake();
   db.transaction(() => {
     q.insertMessage.run(id, channel.id, author.id, content, type, reference_id, reply_ping ? 1 : 0, meta && JSON.stringify(meta));
+    for (const a of attachments) q.linkAttachment.run(id, a.filename, a.width, a.height, a.position, a.row.id);
     q.touchChannel.run(id, channel.id);
   })();
   // Primeira mensagem de uma DM: o outro lado ainda não conhece o canal.
@@ -759,17 +867,10 @@ function dispatchMessageUpdate(channel, messageId) {
 api.post('/channels/:channelId/messages', (req, res) => {
   const channel = loadMessageChannel(req);
   const content = String(req.body?.content ?? '').trim();
-  if (content.length < 1 || content.length > 2000) fail(400, 'A mensagem precisa ter de 1 a 2000 caracteres.');
-
-  if (channel.guild_id) {
-    req.params.guildId = channel.guild_id;
-    loadGuild(req, P.SEND_MESSAGES);
-  } else if (channel.type === CHANNEL_DM) {
-    const other = dmRecipientIds(channel.id).find((id) => id !== req.user.id);
-    const blocked = q.relationship.get(req.user.id, other)?.type === REL.BLOCKED
-      || q.relationship.get(other, req.user.id)?.type === REL.BLOCKED;
-    if (blocked) fail(403, 'Sua mensagem não pôde ser entregue. Isso acontece quando um dos dois bloqueou o outro.');
-  }
+  if (!canSendIn(req, channel)) fail(403, 'Você não tem permissão para fazer isso.');
+  if (isBlockedDm(req, channel)) fail(403, 'Sua mensagem não pôde ser entregue. Isso acontece quando um dos dois bloqueou o outro.');
+  const attachments = claimAttachments(req, channel);
+  if (content.length > 2000 || (!content && !attachments.length)) fail(400, 'A mensagem precisa ter de 1 a 2000 caracteres.');
 
   // Resposta: message_reference + allowed_mentions.replied_user (menciona o autor), como no Discord.
   let reference = null;
@@ -783,6 +884,7 @@ api.post('/channels/:channelId/messages', (req, res) => {
     type: reference ? MSG.REPLY : MSG.DEFAULT,
     reference_id: reference?.id ?? null,
     reply_ping: reference ? req.body?.allowed_mentions?.replied_user !== false : false,
+    attachments,
   });
   res.status(201).json(message);
 });
@@ -792,7 +894,8 @@ api.patch('/channels/:channelId/messages/:messageId', (req, res) => {
   const message = loadMessage(req, channel);
   if (message.author_id !== req.user.id || !isUserMessage(message)) fail(403, 'Você só pode editar suas próprias mensagens.');
   const content = String(req.body?.content ?? '').trim();
-  if (content.length < 1 || content.length > 2000) fail(400, 'A mensagem precisa ter de 1 a 2000 caracteres.');
+  const hasAttachments = q.attachmentsOfMessage.all(message.id).length > 0;
+  if (content.length > 2000 || (!content && !hasAttachments)) fail(400, 'A mensagem precisa ter de 1 a 2000 caracteres.');
 
   if (content !== message.content) {
     q.editMessage.run(content, new Date().toISOString(), message.id);
@@ -808,7 +911,9 @@ api.delete('/channels/:channelId/messages/:messageId', (req, res) => {
     fail(403, 'Você não tem permissão para fazer isso.');
   }
 
+  const files = q.attachmentsOfMessage.all(message.id);
   q.deleteMessage.run(message.id);
+  for (const a of files) removeUpload(a);
   dispatchToChannel(channel, 'MESSAGE_DELETE', { id: message.id, channel_id: channel.id, guild_id: channel.guild_id });
   if (message.pinned_at) dispatchPinsUpdate(channel);
   res.status(204).end();

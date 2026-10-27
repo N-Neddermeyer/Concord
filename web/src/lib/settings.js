@@ -18,6 +18,7 @@ const DEFAULTS = {
   autoGainControl: true,
   desktopNotifications: true,
   sounds: true,
+  callHeaderHeight: null, // altura da chamada na DM, ajustada arrastando a borda (null = padrão)
 };
 
 function load() {

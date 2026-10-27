@@ -1,17 +1,21 @@
-import { AtSign, Hash, Phone, Pin, UserPlus, Users, Video, X } from 'lucide-react';
+import { AtSign, File, FileCode, FileImage, FileText, Hash, Phone, Pin, UserPlus, Users, Video, X } from 'lucide-react';
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../lib/api.js';
+import { useCallLayout } from '../lib/callLayout.js';
 import { acceptCall, startCall, startVideoCall } from '../lib/calls.js';
 import { openPopout, showError, useDialogs } from '../lib/dialogs.js';
 import { isUserMessage } from '../lib/messages.js';
 import { P, has, memberColor, permissionsFor } from '../lib/permissions.js';
 import { useSettings } from '../lib/settings.js';
-import { REL, dispatch, dmRecipient, isPrivate, privateChannelName, useStore } from '../lib/store.js';
+import { REL, dispatch, dmRecipient, isPrivate, navigate, privateChannelName, useStore } from '../lib/store.js';
+import { useTypingUsers } from '../lib/typing.js';
+import { formatSize } from '../lib/upload.js';
 import { STATUS_LABELS, compareIds, displayName, formatDate } from '../lib/util.js';
 import { useVoice } from '../lib/voice.js';
 import AddToDmPopout from './AddToDmPopout.jsx';
 import Avatar, { GroupIcon } from './Avatar.jsx';
 import CallView from './CallView.jsx';
+import Composer, { lastOwnMessage } from './Composer.jsx';
 import Message, { openReactionPicker } from './Message.jsx';
 import PinsPopout from './PinsPopout.jsx';
 
@@ -85,8 +89,12 @@ export default function Chat({ channelId }) {
   const { messageDisplay } = useSettings();
   const session = useVoice();
   const menuOwner = useDialogs().menu?.owner;
-  const [draft, setDraft] = useState('');
   const [replyTo, setReplyTo] = useState(null); // { message, ping }
+  const [upload, setUpload] = useState(null); // { files, progress, cancel } enquanto envia anexos
+  const [dragging, setDragging] = useState(false);
+  const dragDepth = useRef(0);
+  const composerApi = useRef(null);
+  const typingIds = useTypingUsers(channelId);
   const [editingId, setEditingId] = useState(null);
   const [highlightId, setHighlightId] = useState(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
@@ -112,6 +120,13 @@ export default function Chat({ channelId }) {
   const title = isPrivateChannel ? privateChannelName(state, channel) : channel.name;
 
   const usersByName = useMemo(() => new Map(Object.values(users).map((u) => [u.username.toLowerCase(), u])), [users]);
+  const channels = useStore((s) => s.channels);
+  const channelsByName = useMemo(() => {
+    if (!guildId) return null;
+    const map = new Map();
+    for (const c of Object.values(channels)) if (c.guild_id === guildId && !map.has(c.name.toLowerCase())) map.set(c.name.toLowerCase(), c);
+    return map;
+  }, [channels, guildId]);
 
   useEffect(() => {
     if (manualUnread) setUnreadMarker(readState ?? null);
@@ -149,11 +164,14 @@ export default function Chat({ channelId }) {
   }, [entry?.list]);
 
   // A área de chamada aparece/some acima da lista: quem estava no fim continua no fim.
+  // (Com "Ocultar chat" ou tela cheia a lista fica escondida e perde a rolagem; ao voltar, idem.)
   const hasCall = !!call;
+  const uploading = !!upload;
+  const { layout: callLayout } = useCallLayout(channelId);
   useLayoutEffect(() => {
     const el = scroller.current;
     if (el && stickToBottom.current) el.scrollTop = el.scrollHeight;
-  }, [hasCall]);
+  }, [hasCall, uploading, callLayout]);
 
   // Pular até uma mensagem (fixadas, resposta, link): carrega páginas antigas até achá-la.
   useEffect(() => {
@@ -196,27 +214,23 @@ export default function Chat({ channelId }) {
     }
   };
 
-  const send = async () => {
-    const content = draft.trim();
-    if (!content) return;
-    const reply = replyTo;
-    setDraft('');
-    setReplyTo(null);
-    stickToBottom.current = true;
-    try {
-      const body = { content };
-      if (reply) {
-        body.message_reference = { message_id: reply.message.id };
-        body.allowed_mentions = { replied_user: reply.ping };
-      }
-      // A resposta também chega via gateway (MESSAGE_CREATE); o store ignora duplicatas pelo id.
-      const message = await api(`/channels/${channelId}/messages`, { method: 'POST', body });
-      dispatch({ type: 'MESSAGE_CREATE', d: message });
-    } catch (e) {
-      setDraft(content);
-      setReplyTo(reply);
-      showError(e.message);
-    }
+  // Arrastar arquivos sobre o chat: sobreposição "Enviar para #canal"; Shift ao soltar envia direto.
+  const onDragEnter = (e) => {
+    if (!canSend || !e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    dragDepth.current++;
+    setDragging(true);
+  };
+  const onDragLeave = () => {
+    if (dragDepth.current && --dragDepth.current === 0) setDragging(false);
+  };
+  const onDrop = (e) => {
+    if (!dragging) return;
+    e.preventDefault();
+    dragDepth.current = 0;
+    setDragging(false);
+    if (e.shiftKey) composerApi.current?.sendFilesNow(e.dataTransfer.files);
+    else composerApi.current?.addFiles(e.dataTransfer.files);
   };
 
   const startReply = (message) => {
@@ -236,6 +250,8 @@ export default function Chat({ channelId }) {
     channel,
     list,
     usersByName,
+    channelsByName,
+    onChannel: (c) => navigate(c.guild_id, c.id),
     compact: messageDisplay === 'compact',
     canSend,
     canManage: canManage,
@@ -262,7 +278,16 @@ export default function Chat({ channelId }) {
     : null;
 
   return (
-    <main className="chat">
+    <main className="chat" onDragEnter={onDragEnter} onDragOver={(e) => dragging && e.preventDefault()} onDragLeave={onDragLeave} onDrop={onDrop}>
+      {dragging && (
+        <div className="drop-overlay">
+          <div className="drop-box">
+            <div className="drop-icons"><FileText size={40} /><FileImage size={48} /><FileCode size={40} /></div>
+            <h2>Enviar para <b>{isDm ? `@${title}` : isGroup ? title : `#${title}`}</b></h2>
+            <p>Você pode adicionar comentários antes de enviar. Segure Shift para enviar diretamente.</p>
+          </div>
+        </div>
+      )}
       <header className="chat-header">
         {isDm && (
           <>
@@ -385,6 +410,7 @@ export default function Chat({ channelId }) {
             </Fragment>
           );
         })}
+        {upload && <UploadProgress upload={upload} />}
       </div>
 
       <div className="composer">
@@ -404,40 +430,63 @@ export default function Chat({ channelId }) {
           </div>
         )}
         {canSend ? (
-          <div className={`composer-box${replyTo ? ' replying' : ''}`}>
-            <textarea
-              ref={composer}
-              rows={1}
-              value={draft}
-              placeholder={isDm ? `Conversar com @${title}` : isGroup ? `Conversar em ${title}` : `Conversar em #${title}`}
-              onChange={(e) => setDraft(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault();
-                  send();
-                } else if (e.key === 'Escape' && replyTo) {
-                  e.stopPropagation();
-                  setReplyTo(null);
-                } else if (e.key === 'ArrowUp' && !draft) {
-                  // Seta para cima com o campo vazio edita a sua última mensagem.
-                  const last = [...list].reverse().find((m) => m.author.id === me.id && isUserMessage(m));
-                  if (last) {
-                    e.preventDefault();
-                    setEditingId(last.id);
-                  }
-                }
-              }}
-              maxLength={2000}
-            />
-            {draft.length > 1800 && <span className={`char-count${draft.length >= 2000 ? ' over' : ''}`}>{2000 - draft.length}</span>}
-          </div>
+          <Composer
+            channel={channel}
+            placeholder={isDm ? `Conversar com @${title}` : isGroup ? `Conversar em ${title}` : `Conversar em #${title}`}
+            replyTo={replyTo}
+            onClearReply={() => setReplyTo(null)}
+            onRestoreReply={setReplyTo}
+            onSent={() => { stickToBottom.current = true; }}
+            onEditLast={() => {
+              const last = lastOwnMessage(list);
+              if (last) setEditingId(last.id);
+              return !!last;
+            }}
+            onUpload={setUpload}
+            apiRef={composerApi}
+            textareaRef={composer}
+          />
         ) : (
           <div className="composer-box disabled">
             {blocked ? 'Você não pode enviar mensagens para um usuário que você bloqueou.' : 'Você não tem permissão para enviar mensagens neste canal.'}
           </div>
         )}
+        <TypingIndicator ids={typingIds} users={users} />
       </div>
     </main>
+  );
+}
+
+// "Fulano está digitando…" embaixo do compositor, com os três pontos animados.
+function TypingIndicator({ ids, users }) {
+  if (!ids.length) return <div className="typing-indicator" />;
+  const names = ids.map((id) => <b key={id}>{displayName(users[id])}</b>);
+  const text = ids.length === 1 ? <>{names[0]} está digitando…</>
+    : ids.length === 2 ? <>{names[0]} e {names[1]} estão digitando…</>
+    : ids.length === 3 ? <>{names[0]}, {names[1]} e {names[2]} estão digitando…</>
+    : <>Várias pessoas estão digitando…</>;
+  return (
+    <div className="typing-indicator" aria-live="polite">
+      <span className="typing-dots"><i /><i /><i /></span>
+      <span className="typing-text">{text}</span>
+    </div>
+  );
+}
+
+// Envio de anexos em andamento: aparece no fim da lista, com progresso e cancelar.
+function UploadProgress({ upload }) {
+  const { files, progress, cancel } = upload;
+  const label = files.length === 1 ? files[0].filename : `Enviando ${files.length} arquivos`;
+  const total = files.reduce((sum, p) => sum + p.file.size, 0);
+  return (
+    <div className="upload-progress">
+      <File size={36} strokeWidth={1.5} className="file-icon" />
+      <div className="upload-progress-body">
+        <div className="upload-progress-name"><span>{label}</span><small>{formatSize(total)}</small></div>
+        <div className="upload-progress-bar"><span style={{ width: `${Math.round(progress * 100)}%` }} /></div>
+      </div>
+      <button className="upload-progress-cancel" aria-label="Cancelar envio" title="Cancelar" onClick={cancel}><X size={20} /></button>
+    </div>
   );
 }
 

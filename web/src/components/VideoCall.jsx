@@ -1,5 +1,11 @@
-import { HeadphoneOff, Headphones, Maximize, Mic, MicOff, Monitor, MonitorUp, PhoneOff, Video, VideoOff } from 'lucide-react';
+import {
+  HeadphoneOff, Headphones, Maximize, MessageSquare, MessageSquareOff, Mic, MicOff, Minimize, Monitor, MonitorUp, PhoneOff, Video,
+  VideoOff,
+} from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
+import {
+  LAYOUT, fullscreenParticipant, selectParticipant, toggleChat, toggleFullScreen, useCallLayout,
+} from '../lib/callLayout.js';
 import { openModal } from '../lib/dialogs.js';
 import { native } from '../lib/native.js';
 import { useStore } from '../lib/store.js';
@@ -39,26 +45,22 @@ export function useVideoTiles(channelId, userIds) {
   return tiles;
 }
 
-export function VideoTile({ tile, focused = false, onFocus, children }) {
+// Clique destaca o bloco; duplo clique ou o botão do canto põem o bloco em tela cheia
+// (destaca e entra em tela cheia, como o handleFullscreenParticipant do Discord).
+export function VideoTile({ tile, focused = false, fullscreen = false, onFocus, onFullscreen, children }) {
   const me = useStore((s) => s.user.id);
   const speaking = useStore((s) => !!s.speaking[tile.user.id]);
-  const ref = useRef(null);
   const { user, state, kind, track } = tile;
   const isScreen = kind === 'screen';
   const showVideo = !!track;
-
-  const fullscreen = () => {
-    if (document.fullscreenElement) document.exitFullscreen();
-    else ref.current?.requestFullscreen?.().catch(() => {});
-  };
+  const label = fullscreen && focused ? 'Sair da tela cheia' : 'Tela cheia';
 
   return (
     <div
-      ref={ref}
       className={`video-tile${speaking && !isScreen && state ? ' speaking' : ''}${focused ? ' focused' : ''}${isScreen ? ' screen' : ''}${state ? '' : ' ringing'}`}
       style={showVideo ? undefined : { background: user.banner_color ?? '#2b2d31' }}
       onClick={onFocus}
-      onDoubleClick={fullscreen}
+      onDoubleClick={onFullscreen}
     >
       {showVideo ? (
         <VideoTrack track={track} mirror={!isScreen && user.id === me} contain={isScreen || focused} />
@@ -79,28 +81,54 @@ export function VideoTile({ tile, focused = false, onFocus, children }) {
         {!isScreen && state?.self_deaf ? <HeadphoneOff size={14} /> : !isScreen && state?.self_mute ? <MicOff size={14} /> : null}
         <span>{displayName(user)}</span>
       </div>
-      <button className="video-tile-fullscreen" aria-label="Tela cheia" title="Tela cheia" onClick={(e) => { e.stopPropagation(); fullscreen(); }}>
-        <Maximize size={16} />
+      <button
+        className="video-tile-fullscreen"
+        aria-label={label}
+        title={label}
+        onClick={(e) => { e.stopPropagation(); onFullscreen?.(); }}
+        onDoubleClick={(e) => e.stopPropagation()}
+      >
+        {fullscreen && focused ? <Minimize size={16} /> : <Maximize size={16} />}
       </button>
     </div>
   );
 }
 
 // Grade de blocos com foco: clicar num bloco o amplia (os outros ficam numa faixa embaixo).
-export function VideoGrid({ tiles, extra = null }) {
-  const [focusKey, setFocusKey] = useState(null);
-  const focused = tiles.find((t) => t.key === focusKey) ?? null;
-  const toggle = (key) => setFocusKey((current) => (current === key ? null : key));
+// O destaque fica no layout do canal, então sobrevive a entrar e sair da tela cheia.
+export function VideoGrid({ channelId, tiles, extra = null }) {
+  const { layout, selected } = useCallLayout(channelId);
+  const me = useStore((s) => s.user.id);
+  const fullscreen = layout === LAYOUT.FULL_SCREEN;
+  const focused = tiles.find((t) => t.key === selected) ?? null;
+
+  // Quando alguém começa a transmitir a tela, ela vai para o destaque (se nada estiver em destaque).
+  const remoteScreens = tiles.filter((t) => t.kind === 'screen' && t.user.id !== me).map((t) => t.key).join(',');
+  const seenScreens = useRef(new Set());
+  useEffect(() => {
+    const keys = remoteScreens ? remoteScreens.split(',') : [];
+    const fresh = keys.find((k) => !seenScreens.current.has(k));
+    seenScreens.current = new Set(keys);
+    if (fresh && !focused) selectParticipant(channelId, fresh);
+  }, [remoteScreens]); // só quando muda o conjunto de telas
+  const props = (t) => ({
+    tile: t,
+    fullscreen,
+    onFocus: () => selectParticipant(channelId, selected === t.key ? null : t.key),
+    onFullscreen: () => fullscreenParticipant(channelId, t.key),
+  });
 
   if (focused) {
     return (
       <div className="video-grid focus-mode">
         <div className="video-focus">
-          <VideoTile tile={focused} focused onFocus={() => toggle(focused.key)} />
+          <VideoTile {...props(focused)} focused />
         </div>
-        <div className="video-strip">
-          {tiles.filter((t) => t !== focused).map((t) => <VideoTile key={t.key} tile={t} onFocus={() => toggle(t.key)} />)}
-        </div>
+        {tiles.length > 1 && (
+          <div className="video-strip">
+            {tiles.filter((t) => t !== focused).map((t) => <VideoTile key={t.key} {...props(t)} />)}
+          </div>
+        )}
       </div>
     );
   }
@@ -108,9 +136,43 @@ export function VideoGrid({ tiles, extra = null }) {
   const columns = count <= 1 ? 1 : count <= 4 ? 2 : 3;
   return (
     <div className="video-grid" style={{ '--columns': columns }}>
-      {tiles.map((t) => <VideoTile key={t.key} tile={t} onFocus={() => toggle(t.key)} />)}
+      {tiles.map((t) => <VideoTile key={t.key} {...props(t)} />)}
       {extra}
     </div>
+  );
+}
+
+// --- barra de baixo da chamada (esquerda: chat; centro: controles; direita: tela cheia) ---
+
+export function CallBar({ left = null, center, right = null }) {
+  return (
+    <div className="call-bar">
+      <div className="call-bar-side left">{left}</div>
+      {center}
+      <div className="call-bar-side right">{right}</div>
+    </div>
+  );
+}
+
+export function ToggleChatButton({ channelId }) {
+  const { layout } = useCallLayout(channelId);
+  const chatOpen = layout === LAYOUT.NORMAL;
+  const label = chatOpen ? 'Ocultar chat' : 'Mostrar chat';
+  return (
+    <button className="call-bar-button" aria-label={label} title={label} onClick={() => toggleChat(channelId)}>
+      {chatOpen ? <MessageSquareOff size={22} /> : <MessageSquare size={22} />}
+    </button>
+  );
+}
+
+export function FullscreenButton({ channelId }) {
+  const { layout } = useCallLayout(channelId);
+  const full = layout === LAYOUT.FULL_SCREEN;
+  const label = full ? 'Sair da tela cheia' : 'Tela cheia';
+  return (
+    <button className="call-bar-button" aria-label={label} title={label} onClick={() => toggleFullScreen(channelId)}>
+      {full ? <Minimize size={22} /> : <Maximize size={22} />}
+    </button>
   );
 }
 

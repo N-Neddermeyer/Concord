@@ -177,6 +177,28 @@ const migrations = [
       CREATE INDEX messages_pinned ON messages(channel_id, pinned_at) WHERE pinned_at IS NOT NULL;
     `);
   },
+  // 4: anexos. O upload vem antes da mensagem (como no Discord): a linha nasce sem message_id
+  // e é ligada à mensagem quando ela é enviada. `upload_key` é o diretório do arquivo em disco.
+  () => {
+    db.exec(`
+      CREATE TABLE attachments (
+        id           TEXT PRIMARY KEY,
+        channel_id   TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+        message_id   TEXT REFERENCES messages(id) ON DELETE CASCADE,
+        uploader_id  TEXT NOT NULL REFERENCES users(id),
+        upload_key   TEXT NOT NULL UNIQUE,
+        filename     TEXT NOT NULL,
+        size         INTEGER NOT NULL,
+        content_type TEXT,
+        width        INTEGER,
+        height       INTEGER,
+        uploaded     INTEGER NOT NULL DEFAULT 0,
+        position     INTEGER NOT NULL DEFAULT 0,
+        created_at   TEXT NOT NULL
+      );
+      CREATE INDEX attachments_by_message ON attachments(message_id);
+    `);
+  },
 ];
 
 // Mudanças de esquema rodam com as chaves estrangeiras desligadas (exigência do SQLite
@@ -217,6 +239,8 @@ export const MSG = {
   REPLY: 19,
 };
 export const MESSAGE_CALL = MSG.CALL;
+
+export const ATTACHMENTS_DIR = path.join(dataDir, 'attachments');
 
 const AUTHOR_COLUMNS = 'u.username, u.global_name, u.avatar, u.color, u.banner_color, u.bio';
 
@@ -327,6 +351,15 @@ export const q = {
   reactionKinds: db.prepare('SELECT COUNT(DISTINCT emoji) AS n FROM reactions WHERE message_id = ?'),
   deleteMessage: db.prepare('DELETE FROM messages WHERE id = ?'),
 
+  insertAttachment: db.prepare(`
+    INSERT INTO attachments (id, channel_id, uploader_id, upload_key, filename, size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`),
+  attachmentByKey: db.prepare('SELECT * FROM attachments WHERE upload_key = ?'),
+  markUploaded: db.prepare('UPDATE attachments SET uploaded = 1, size = ?, content_type = ? WHERE id = ?'),
+  linkAttachment: db.prepare('UPDATE attachments SET message_id = ?, filename = ?, width = ?, height = ?, position = ? WHERE id = ?'),
+  attachmentsOfMessage: db.prepare('SELECT * FROM attachments WHERE message_id = ? ORDER BY position'),
+  staleUploads: db.prepare('SELECT * FROM attachments WHERE message_id IS NULL AND created_at < ?'),
+  deleteAttachment: db.prepare('DELETE FROM attachments WHERE id = ?'),
+
   invite: db.prepare('SELECT * FROM invites WHERE code = ?'),
   invitesOf: db.prepare(`
     SELECT i.code, i.uses, i.created_at, i.creator_id, ${AUTHOR_COLUMNS} FROM invites i
@@ -377,8 +410,21 @@ export function toMessage(m) {
     message.reply_ping = !!m.reply_ping;
   }
   if (m.meta) message.meta = JSON.parse(m.meta);
+  message.attachments = [];
   return message;
 }
+
+export const attachmentUrl = (a) => `/attachments/${a.upload_key}/${encodeURIComponent(a.filename)}`;
+
+export const toAttachment = (a) => ({
+  id: a.id,
+  filename: a.filename,
+  size: a.size,
+  url: attachmentUrl(a),
+  content_type: a.content_type ?? null,
+  width: a.width ?? null,
+  height: a.height ?? null,
+});
 
 // Completa as mensagens com reações, a mensagem respondida e os usuários citados nas
 // mensagens de sistema (adicionou/removeu alguém do grupo).
@@ -387,10 +433,12 @@ export function loadMessages(rows) {
   if (!messages.length) return messages;
 
   const ids = messages.map((m) => m.id);
+  const marks = ids.map(() => '?').join(',');
   const reactions = database.all(
-    `SELECT message_id, emoji, user_id FROM reactions WHERE message_id IN (${ids.map(() => '?').join(',')}) ORDER BY created_at`,
+    `SELECT message_id, emoji, user_id FROM reactions WHERE message_id IN (${marks}) ORDER BY created_at`,
     ids,
   );
+  const attachments = database.all(`SELECT * FROM attachments WHERE message_id IN (${marks}) ORDER BY position`, ids);
   for (const m of messages) {
     const byEmoji = new Map();
     for (const r of reactions) {
@@ -399,10 +447,11 @@ export function loadMessages(rows) {
       byEmoji.get(r.emoji).push(r.user_id);
     }
     m.reactions = [...byEmoji].map(([emoji, user_ids]) => ({ emoji, user_ids }));
+    m.attachments = attachments.filter((a) => a.message_id === m.id).map(toAttachment);
 
     if (m.message_reference) {
       const ref = q.messageWithAuthor.get(m.message_reference.message_id);
-      m.referenced_message = ref ? toMessage(ref) : null;
+      m.referenced_message = ref ? { ...toMessage(ref), attachments: q.attachmentsOfMessage.all(ref.id).map(toAttachment) } : null;
     }
     if (m.meta?.user_id) {
       const user = q.userById.get(m.meta.user_id);

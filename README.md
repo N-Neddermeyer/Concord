@@ -62,6 +62,16 @@ não libera esses dispositivos (exige HTTPS); use o app desktop.
   Excluir e Copiar ID. "(editado)", reações embaixo da mensagem, resposta com a mensagem citada,
   "Mensagens fixadas" no cabeçalho (com "Pular") e mensagem de sistema "fixou uma mensagem".
   Fora de propósito: Apps, Falar mensagem e Denunciar.
+- **Escrever mensagens**: markdown do Discord (negrito, itálico, sublinhado, riscado, `código`, blocos
+  de código, citações `>` e `>>>`, títulos `#`, subtexto `-#`, listas, `||spoiler||`, `[texto](link)`,
+  `\` para escapar) e emojis grandes quando a mensagem só tem emojis. "Fulano está digitando…"
+  embaixo do campo. Autocompletar de `@membro` (com `@everyone`/`@here` em servidor), `#canal` e
+  `:emoji`, com setas, Tab/Enter e Esc. Botão de emoji no campo. O rascunho fica guardado por canal.
+- **Anexos**: botão +, arrastar e soltar (Shift ao soltar envia direto) ou colar. Até 10 arquivos de
+  até 10 MB, com prévia, spoiler e renomear antes de enviar, e barra de progresso com cancelar. Colar
+  um texto que passa de 2000 caracteres vira `message.txt`. Na mensagem: imagens em mosaico (clique
+  abre o visualizador), vídeo e áudio com player, e os demais como cartão de download. Mesmo fluxo
+  do Discord: `POST /channels/:id/attachments`, `PUT` do arquivo e a mensagem cita o upload.
 - **Chamada individual na DM**: botão de ligar no cabeçalho, área de chamada com os dois avatares
   (toque com ondas, anel de fala, selo de mudo), popup de chamada recebida (atender/recusar), toques
   de "chamada recebida" e "chamando…", "Chamar" de novo, toque expira em 45 s, e mensagem de sistema
@@ -84,6 +94,12 @@ não libera esses dispositivos (exige HTTPS); use o app desktop.
   para tela cheia, selo "Ao vivo" e ícone de câmera na lista do canal. No desktop, o seletor de
   "Compartilhar tela" (Aplicativos/Telas, 15/30/60 FPS); no navegador, o seletor do próprio navegador.
   A tela vai sem áudio. Em Voz e vídeo: escolha da câmera e "Testar vídeo".
+- **Layouts da chamada** (mesmo modelo do Discord): na DM, arrastar a borda de baixo da chamada ajusta
+  a altura (de 230 px até a altura do canal menos 200; fica salva). Com vídeo, "Ocultar chat" faz a
+  chamada ocupar o canal e "Tela cheia" põe o app inteiro em tela cheia (Esc volta ao layout anterior).
+  O botão de tela cheia de um bloco (ou duplo clique) destaca aquela câmera/tela e entra em tela cheia.
+  A tela que outra pessoa começa a transmitir vai sozinha para o destaque. Os controles somem após 2 s
+  parado.
 
 Atalhos: `Ctrl+K` busca rápida, `Ctrl+Shift+M` mudo, `Ctrl+Shift+D` ensurdecer, `Esc` fecha
 configurações e modais; no desktop, `Ctrl+R` recarrega, `Ctrl+Shift+I` abre o DevTools e
@@ -113,14 +129,15 @@ dispositivo (`localStorage`), não na conta.
 
 Fica em `server/data/clone.db`. O esquema é versionado por `PRAGMA user_version` e migrado
 automaticamente ao subir o servidor; a cópia `clone.db.bak-antes-v1` é o banco antes da
-primeira migração.
+primeira migração. Os anexos ficam em `server/data/attachments/` (um diretório por arquivo).
+Só imagem, vídeo e áudio abrem no navegador; os demais tipos são sempre servidos como download.
 
 ## Limitações conhecidas
 
 - Sem logo própria por enquanto: o botão de início usa um ícone genérico e a bandeja um círculo.
 - Voz P2P em malha: boa para poucas pessoas na mesma rede. Para mais gente, troque por um SFU (LiveKit, mediasoup).
 - Sem STUN/TURN: funciona em `localhost` e na rede local, não pela internet.
-- Sem permissões por canal (overwrites), anexos ou emojis personalizados.
+- Sem permissões por canal (overwrites) nem emojis personalizados. Blocos de código sem cores de sintaxe.
 - Vídeo em malha: cada um envia sua câmera/tela para cada participante, então pesa com muita gente.
 - Sem TLS: tráfego em `http`/`ws` e mensagens gravadas em texto puro no banco.
 - O servidor escuta só em `127.0.0.1` (`npm run start:lan` escuta na rede); no navegador o microfone

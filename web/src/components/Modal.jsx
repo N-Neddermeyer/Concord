@@ -88,8 +88,10 @@ export function useAnchoredPosition(rect, side = 'right', gap = 8) {
       : side === 'below' ? rect.left
       : side === 'below-end' ? rect.right - width
       : rect.right + gap;
-    let top = side === 'below' || side === 'below-end' ? rect.bottom + gap : side === 'above' ? rect.top - height - gap : rect.top;
+    let top = side === 'below' || side === 'below-end' ? rect.bottom + gap
+      : side === 'above' || side === 'above-end' ? rect.top - height - gap : rect.top;
     if (side === 'above') left = rect.left;
+    if (side === 'above-end') left = rect.right - width;
     if (side === 'right' && left + width > innerWidth - 8) left = rect.left - width - gap;
     left = Math.max(8, Math.min(left, innerWidth - width - 8));
     top = Math.max(8, Math.min(top, innerHeight - height - 8));

@@ -26,7 +26,9 @@ gateway.on((t, d) => {
   const title = channel?.guild_id
     ? `${displayName(d.author)} (#${channel.name}, ${s.guilds[channel.guild_id]?.name})`
     : channel?.type === 3 ? `${displayName(d.author)} (${privateChannelName(s, channel)})` : displayName(d.author);
-  const notification = new Notification(title, { body: d.content.slice(0, 200), icon: d.author.avatar ?? undefined, silent: true });
+  const files = d.attachments?.length ?? 0;
+  const body = d.content || (files ? `Enviou ${files === 1 ? 'um anexo' : `${files} anexos`}.` : '');
+  const notification = new Notification(title, { body: body.slice(0, 200), icon: d.author.avatar ?? undefined, silent: true });
   notification.onclick = () => {
     window.focus();
     native?.window.focus();

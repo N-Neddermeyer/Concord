@@ -367,9 +367,9 @@ function registerIpc() {
   }));
 }
 
-// Microfone, câmera, tela e notificações só para a origem do app; todo o resto é negado.
+// Microfone, câmera, tela, notificações e tela cheia (chamada) só para a origem do app; o resto é negado.
 function configurePermissions() {
-  const allowed = new Set(['media', 'notifications', 'clipboard-sanitized-write', 'speaker-selection']);
+  const allowed = new Set(['media', 'notifications', 'clipboard-sanitized-write', 'speaker-selection', 'fullscreen']);
   const fromApp = (url) => {
     try {
       return new URL(url).origin === APP_URL.origin;
