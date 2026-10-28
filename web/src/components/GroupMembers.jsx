@@ -4,6 +4,7 @@ import { confirmDialog, openPopout, showError } from '../lib/dialogs.js';
 import { useStore } from '../lib/store.js';
 import { displayName } from '../lib/util.js';
 import Avatar from './Avatar.jsx';
+import { CustomStatus } from './CustomStatus.jsx';
 
 // Lista de membros de um grupo de DM (à direita, como no Discord). O dono pode remover pessoas.
 export default function GroupMembers({ channel }) {
@@ -11,6 +12,7 @@ export default function GroupMembers({ channel }) {
   const users = useStore((s) => s.users);
   const presences = useStore((s) => s.presences);
   const speaking = useStore((s) => s.speaking);
+  const activities = useStore((s) => s.activities);
 
   const members = [me, ...channel.recipients.map((u) => users[u.id] ?? u)]
     .sort((a, b) => displayName(a).localeCompare(displayName(b)));
@@ -38,8 +40,13 @@ export default function GroupMembers({ channel }) {
               onClick={(e) => openPopout({ userId: user.id, rect: e.currentTarget.getBoundingClientRect(), side: 'left' })}
             >
               <Avatar user={user} size={32} status={status} speaking={!!speaking[user.id]} />
-              <span className="member-name">{displayName(user)}</span>
-              {user.id === channel.owner_id && <Crown size={14} className="owner-crown" aria-label="Dono do grupo" />}
+              <span className="member-text">
+                <span className="member-name-row">
+                  <span className="member-name">{displayName(user)}</span>
+                  {user.id === channel.owner_id && <Crown size={14} className="owner-crown" aria-label="Dono do grupo" />}
+                </span>
+                {status !== 'offline' && <CustomStatus status={user.id === me.id ? me.custom_status : activities[user.id]} className="member-activity" />}
+              </span>
             </button>
             {isOwner && user.id !== me.id && (
               <button className="group-member-remove" aria-label={`Remover ${displayName(user)}`} title="Remover do grupo" onClick={() => remove(user)}>

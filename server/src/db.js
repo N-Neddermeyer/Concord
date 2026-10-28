@@ -249,6 +249,32 @@ const migrations = [
       database.run('UPDATE channels SET parent_id = ? WHERE guild_id = ? AND type = 2', [voice, id]);
     }
   },
+  // 6: status personalizado, notas sobre usuários e conversas (threads). Uma conversa é um canal
+  // tipo 11 cujo parent_id é o canal de texto; criada a partir de uma mensagem, tem o id dela.
+  () => {
+    db.exec(`
+      ALTER TABLE users ADD COLUMN custom_status TEXT;
+      CREATE TABLE user_notes (
+        user_id   TEXT NOT NULL REFERENCES users(id),
+        target_id TEXT NOT NULL REFERENCES users(id),
+        note      TEXT NOT NULL,
+        PRIMARY KEY (user_id, target_id)
+      );
+      ALTER TABLE channels ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE channels ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE channels ADD COLUMN locked INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE channels ADD COLUMN auto_archive_duration INTEGER;
+      ALTER TABLE channels ADD COLUMN archive_timestamp TEXT;
+      CREATE INDEX channels_by_parent ON channels(parent_id);
+      CREATE TABLE thread_members (
+        channel_id     TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+        user_id        TEXT NOT NULL REFERENCES users(id),
+        join_timestamp TEXT NOT NULL,
+        PRIMARY KEY (channel_id, user_id)
+      );
+      CREATE INDEX thread_members_by_user ON thread_members(user_id);
+    `);
+  },
 ];
 
 // Mudanças de esquema rodam com as chaves estrangeiras desligadas (exigência do SQLite
@@ -277,6 +303,7 @@ export const CHANNEL_DM = 1;
 export const CHANNEL_VOICE = 2;
 export const CHANNEL_GROUP_DM = 3;
 export const CHANNEL_CATEGORY = 4;
+export const CHANNEL_THREAD = 11; // PUBLIC_THREAD do Discord
 
 export const REL = { FRIEND: 1, BLOCKED: 2, INCOMING: 3, OUTGOING: 4 };
 // Tipos de mensagem do Discord usados aqui.
@@ -288,7 +315,9 @@ export const MSG = {
   CHANNEL_NAME_CHANGE: 4,
   CHANNEL_PINNED_MESSAGE: 6,
   USER_JOIN: 7,
+  THREAD_CREATED: 18,
   REPLY: 19,
+  THREAD_STARTER_MESSAGE: 21,
 };
 export const MESSAGE_CALL = MSG.CALL;
 
@@ -306,6 +335,22 @@ export const q = {
     WHERE id = ?`),
   setStatus: db.prepare('UPDATE users SET status = ? WHERE id = ?'),
   setGuildPositions: db.prepare('UPDATE users SET guild_positions = ? WHERE id = ?'),
+  setCustomStatus: db.prepare('UPDATE users SET custom_status = ? WHERE id = ?'),
+  withCustomStatus: db.prepare('SELECT id, custom_status FROM users WHERE custom_status IS NOT NULL'),
+
+  note: db.prepare('SELECT note FROM user_notes WHERE user_id = ? AND target_id = ?'),
+  notesOf: db.prepare('SELECT target_id, note FROM user_notes WHERE user_id = ?'),
+  setNote: db.prepare(`
+    INSERT INTO user_notes (user_id, target_id, note) VALUES (?, ?, ?)
+    ON CONFLICT (user_id, target_id) DO UPDATE SET note = excluded.note`),
+  deleteNote: db.prepare('DELETE FROM user_notes WHERE user_id = ? AND target_id = ?'),
+  mutualGuilds: db.prepare(`
+    SELECT o.guild_id AS id, o.nick FROM members m JOIN members o ON o.guild_id = m.guild_id AND o.user_id = ?
+    WHERE m.user_id = ? ORDER BY m.joined_at`),
+  mutualFriends: db.prepare(`
+    SELECT a.target_id AS id FROM relationships a
+    JOIN relationships b ON b.target_id = a.target_id AND b.user_id = ? AND b.type = 1
+    WHERE a.user_id = ? AND a.type = 1`),
 
   guild: db.prepare('SELECT * FROM guilds WHERE id = ?'),
   guildsOf: db.prepare('SELECT g.* FROM guilds g JOIN members m ON m.guild_id = g.id WHERE m.user_id = ? ORDER BY m.joined_at'),
@@ -348,7 +393,22 @@ export const q = {
   updateChannel: db.prepare('UPDATE channels SET name = ?, topic = ? WHERE id = ?'),
   updateGuildChannel: db.prepare('UPDATE channels SET name = ?, topic = ?, nsfw = ?, rate_limit_per_user = ? WHERE id = ?'),
   moveChannel: db.prepare('UPDATE channels SET position = ?, parent_id = ? WHERE id = ?'),
-  orphanChildren: db.prepare('UPDATE channels SET parent_id = NULL WHERE parent_id = ?'),
+  orphanChildren: db.prepare('UPDATE channels SET parent_id = NULL WHERE parent_id = ? AND type != 11'),
+
+  insertThread: db.prepare(`
+    INSERT INTO channels (id, guild_id, name, type, position, parent_id, owner_id, auto_archive_duration, archive_timestamp)
+    VALUES (?, ?, ?, 11, 0, ?, ?, ?, ?)`),
+  updateThread: db.prepare('UPDATE channels SET name = ?, archived = ?, locked = ?, auto_archive_duration = ?, archive_timestamp = ? WHERE id = ?'),
+  bumpMessageCount: db.prepare('UPDATE channels SET message_count = MAX(message_count + ?, 0) WHERE id = ?'),
+  threadsOf: db.prepare('SELECT * FROM channels WHERE parent_id = ? AND type = 11'),
+  activeThreads: db.prepare('SELECT * FROM channels WHERE type = 11 AND archived = 0'),
+  deleteThreadsOf: db.prepare('DELETE FROM channels WHERE parent_id = ? AND type = 11'),
+  threadMemberIds: db.prepare('SELECT user_id FROM thread_members WHERE channel_id = ? ORDER BY join_timestamp'),
+  threadMember: db.prepare('SELECT 1 FROM thread_members WHERE channel_id = ? AND user_id = ?'),
+  addThreadMember: db.prepare('INSERT OR IGNORE INTO thread_members (channel_id, user_id, join_timestamp) VALUES (?, ?, ?)'),
+  removeThreadMember: db.prepare('DELETE FROM thread_members WHERE channel_id = ? AND user_id = ?'),
+  leaveGuildThreads: db.prepare(`
+    DELETE FROM thread_members WHERE user_id = ? AND channel_id IN (SELECT id FROM channels WHERE guild_id = ?)`),
   overwritesOf: db.prepare('SELECT * FROM permission_overwrites WHERE channel_id = ? ORDER BY type, target_id'),
   guildOverwrites: db.prepare(`
     SELECT o.* FROM permission_overwrites o JOIN channels c ON c.id = o.channel_id WHERE c.guild_id = ? ORDER BY o.type, o.target_id`),
@@ -401,6 +461,31 @@ export const q = {
          ORDER BY m.id DESC LIMIT ?`,
         [channel, before, before, limit],
       ),
+  },
+  // Candidatos da pesquisa (o texto, menções e "tem:" são filtrados em JS, sem diferenciar acentos).
+  searchMessages: {
+    all: ({ channels, authors, pinned, minId, maxId }) => {
+      if (!channels.length) return [];
+      const where = [`m.channel_id IN (${channels.map(() => '?').join(',')})`, 'm.type IN (0, 19)'];
+      const params = [...channels];
+      if (authors.length) {
+        where.push(`m.author_id IN (${authors.map(() => '?').join(',')})`);
+        params.push(...authors);
+      }
+      if (pinned !== null) where.push(pinned ? 'm.pinned_at IS NOT NULL' : 'm.pinned_at IS NULL');
+      if (minId) {
+        where.push('m.id > ?');
+        params.push(minId);
+      }
+      if (maxId) {
+        where.push('m.id < ?');
+        params.push(maxId);
+      }
+      return database.all(
+        `SELECT m.*, ${AUTHOR_COLUMNS} FROM messages m JOIN users u ON u.id = m.author_id WHERE ${where.join(' AND ')} ORDER BY m.id DESC`,
+        params,
+      );
+    },
   },
   insertMessage: db.prepare(`
     INSERT INTO messages (id, channel_id, author_id, content, type, reference_id, reply_ping, meta, mention_everyone)
@@ -519,6 +604,32 @@ export const toChannel = (c, overwrites = q.overwritesOf.all(c.id).map(toOverwri
   last_message_id: c.last_message_id ?? null,
   permission_overwrites: overwrites,
 });
+
+// Conversa (thread) no formato do Discord, com quem participa e a última mensagem (para a prévia).
+export function toThread(c) {
+  const memberIds = q.threadMemberIds.all(c.id).map((r) => r.user_id);
+  const last = c.last_message_id && q.messageWithAuthor.get(c.last_message_id);
+  return {
+    id: c.id,
+    type: c.type,
+    guild_id: c.guild_id,
+    parent_id: c.parent_id,
+    owner_id: c.owner_id,
+    name: c.name,
+    last_message_id: c.last_message_id ?? null,
+    message_count: c.message_count ?? 0,
+    member_count: memberIds.length,
+    member_ids: memberIds,
+    rate_limit_per_user: c.rate_limit_per_user ?? 0,
+    thread_metadata: {
+      archived: !!c.archived,
+      locked: !!c.locked,
+      auto_archive_duration: c.auto_archive_duration ?? 1440,
+      archive_timestamp: c.archive_timestamp,
+    },
+    last_message: last && (last.type === MSG.DEFAULT || last.type === MSG.REPLY) ? toMessage(last) : null,
+  };
+}
 
 // Completa as mensagens com reações, a mensagem respondida e os usuários citados nas
 // mensagens de sistema (adicionou/removeu alguém do grupo).

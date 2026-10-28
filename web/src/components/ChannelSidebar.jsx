@@ -12,6 +12,7 @@ import { dispatch, isUnread, memberName, navigate, openLayer, useStore } from '.
 import { voice } from '../lib/voice.js';
 import Avatar from './Avatar.jsx';
 import { CreateCategoryModal, CreateChannelModal, InviteModal, NicknameModal } from './modals.jsx';
+import { SidebarThreads, threadMenuItems } from './Threads.jsx';
 
 const SETTINGS_PERMS = P.MANAGE_GUILD | P.MANAGE_ROLES | P.KICK_MEMBERS | P.BAN_MEMBERS | P.VIEW_AUDIT_LOG;
 
@@ -146,6 +147,11 @@ export default function ChannelSidebar({ guildId, activeChannelId }) {
     });
   };
 
+  const threadMenu = (e, thread) => {
+    e.preventDefault();
+    openMenu({ rect: pointRect(e), side: 'right', items: threadMenuItems(thread, state) });
+  };
+
   const listMenu = (e) => {
     if (e.target !== e.currentTarget || !(canManageChannels || canInvite)) return;
     e.preventDefault();
@@ -237,7 +243,8 @@ export default function ChannelSidebar({ guildId, activeChannelId }) {
     const active = c.id === activeChannelId;
     const unread = c.type === TEXT && isUnread(state, c);
     const participants = c.type === VOICE ? Object.values(voiceStates).filter((v) => v.channel_id === c.id) : [];
-    if (isCollapsed && !active && !unread && participants.length === 0) return null;
+    const threadOpen = channels[activeChannelId]?.type === 11 && channels[activeChannelId].parent_id === c.id;
+    if (isCollapsed && !active && !unread && participants.length === 0 && !threadOpen) return null;
     const cp = channelPerms(c);
     return (
       <div key={c.id} {...dragProps(c)} {...dropProps(c)} className={`channel-wrap${dropClass(c.id)}`}>
@@ -283,6 +290,7 @@ export default function ChannelSidebar({ guildId, activeChannelId }) {
             </span>
           </button>
         ))}
+        {c.type === TEXT && <SidebarThreads channel={c} activeId={activeChannelId} collapsed={isCollapsed} onMenu={threadMenu} />}
       </div>
     );
   };

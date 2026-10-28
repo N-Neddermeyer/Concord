@@ -5,7 +5,9 @@ import { memberRoles } from '../lib/permissions.js';
 import { HOME, REL, getState, navigate, openLayer, useStore } from '../lib/store.js';
 import { displayName, formatShortDate } from '../lib/util.js';
 import Avatar from './Avatar.jsx';
+import { CustomStatus, useCustomStatus } from './CustomStatus.jsx';
 import { useAnchoredPosition } from './Modal.jsx';
+import { NoteField, openProfile } from './UserProfile.jsx';
 
 // Abre (ou cria) a DM com o usuário e navega até ela.
 export async function openGroup(userIds) {
@@ -27,21 +29,29 @@ export async function openDm(userId) {
   }
 }
 
-export function ProfileCard({ user, status, guildId, children, preview = false }) {
+export function ProfileCard({ user, status, guildId, children, preview = false, onOpenProfile }) {
   const state = useStore((s) => s);
+  const custom = useCustomStatus(user.id);
   const roles = guildId ? memberRoles(state, guildId, user.id).filter((r) => r.id !== guildId) : [];
   const joinedAt = guildId ? state.members[guildId]?.[user.id]?.joined_at : null;
   const nick = guildId ? state.members[guildId]?.[user.id]?.nick : null;
   return (
     <div className="profile-card">
       <div className="profile-banner" style={{ background: user.banner_color ?? user.color }} />
-      <div className="profile-avatar">
-        <Avatar user={user} size={80} status={status} />
-      </div>
+      {onOpenProfile ? (
+        <button className="profile-avatar clickable" aria-label="Ver perfil completo" title="Ver perfil completo" onClick={onOpenProfile}>
+          <Avatar user={user} size={80} status={status} />
+        </button>
+      ) : (
+        <div className="profile-avatar">
+          <Avatar user={user} size={80} status={status} />
+        </div>
+      )}
       <div className="profile-body">
         <div className="profile-names">
           <div className="profile-display">{nick || displayName(user)}</div>
           <div className="profile-username">{user.username}{nick && <span className="muted"> · {displayName(user)}</span>}</div>
+          {custom && <div className="profile-custom-status"><CustomStatus status={custom} /></div>}
         </div>
         {(user.bio || preview) && (
           <section>
@@ -99,7 +109,13 @@ export default function UserPopout({ userId, guildId, rect, side = 'right' }) {
 
   return (
     <div className="popout" ref={ref} style={pos} onMouseDown={(e) => e.stopPropagation()}>
-      <ProfileCard user={user} status={status} guildId={guildId}>
+      <ProfileCard user={user} status={status} guildId={guildId} onOpenProfile={() => openProfile(userId, guildId)}>
+        {!isMe && (
+          <section>
+            <h3>Nota</h3>
+            <NoteField userId={userId} />
+          </section>
+        )}
         <div className="profile-actions">
           {isMe ? (
             <button
@@ -126,6 +142,7 @@ export default function UserPopout({ userId, guildId, rect, side = 'right' }) {
             </>
           )}
         </div>
+        <button className="link profile-full-link" onClick={() => openProfile(userId, guildId)}>Ver perfil completo</button>
       </ProfileCard>
     </div>
   );

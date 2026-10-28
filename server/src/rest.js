@@ -4,8 +4,8 @@ import path from 'node:path';
 import express, { Router } from 'express';
 import { hashPassword, newToken, verifyPassword } from './auth.js';
 import {
-  ATTACHMENTS_DIR, CHANNEL_CATEGORY, CHANNEL_DM, CHANNEL_GROUP_DM, CHANNEL_TEXT, CHANNEL_VOICE, MSG, REL, db, loadMessages, messagePayload,
-  privateUser, publicUser, q, toChannel, toOverwrite,
+  ATTACHMENTS_DIR, CHANNEL_CATEGORY, CHANNEL_DM, CHANNEL_GROUP_DM, CHANNEL_TEXT, CHANNEL_THREAD, CHANNEL_VOICE, MSG, REL, db, loadMessages,
+  messagePayload, privateUser, publicUser, q, toChannel, toOverwrite, toThread,
 } from './db.js';
 import {
   broadcastPresence,
@@ -13,6 +13,7 @@ import {
   buildGuild,
   buildMember,
   channelPermissionsOf,
+  customStatusOf,
   disconnectVoice,
   dispatchToChannel,
   dispatchToGuild,
@@ -24,6 +25,7 @@ import {
   isInCall,
   leaveVoice,
   permissionsOf,
+  presenceOf,
   rankOf,
   relatedUserIds,
   ringCall,
@@ -35,7 +37,7 @@ import {
 import {
   ALL_PERMISSIONS, CHANNEL_PERMISSIONS, DEFAULT_PERMISSIONS, OVERWRITE_MEMBER, OVERWRITE_ROLE, P, has,
 } from './permissions.js';
-import { snowflake } from './snowflake.js';
+import { snowflake, timestampOf } from './snowflake.js';
 
 export const api = Router();
 
@@ -124,7 +126,7 @@ function loadChannel(req) {
 
 function loadMessageChannel(req) {
   const channel = loadChannel(req);
-  if (![CHANNEL_TEXT, CHANNEL_DM, CHANNEL_GROUP_DM].includes(channel.type)) fail(404, 'Canal não encontrado.');
+  if (![CHANNEL_TEXT, CHANNEL_DM, CHANNEL_GROUP_DM, CHANNEL_THREAD].includes(channel.type)) fail(404, 'Canal não encontrado.');
   return channel;
 }
 
@@ -187,7 +189,7 @@ function setRelationship(userId, targetId, type) {
   const since = now();
   q.setRelationship.run(userId, targetId, type, since);
   dispatchToUser(userId, 'RELATIONSHIP_ADD', { id: targetId, type, since, user: publicUser(q.userById.get(targetId)) });
-  if (type === REL.FRIEND) dispatchToUser(userId, 'PRESENCE_UPDATE', { user_id: targetId, status: statusOf(targetId) });
+  if (type === REL.FRIEND) dispatchToUser(userId, 'PRESENCE_UPDATE', presenceOf(targetId));
 }
 
 function removeRelationship(userId, targetId) {
@@ -253,6 +255,42 @@ api.delete('/users/@me/relationships/:userId', (req, res) => {
     }
   })();
   res.status(204).end();
+});
+
+// --- notas e perfil completo ---
+
+const MAX_NOTE_LENGTH = 256; // como no Discord
+
+// Nota pessoal sobre outro usuário: só quem escreveu vê.
+api.put('/users/@me/notes/:userId', (req, res) => {
+  const target = q.userById.get(req.params.userId);
+  if (!target || target.id === req.user.id) fail(404, 'Usuário não encontrado.');
+  const note = String(req.body?.note ?? '').trim();
+  if (note.length > MAX_NOTE_LENGTH) fail(400, `A nota pode ter no máximo ${MAX_NOTE_LENGTH} caracteres.`);
+  if (note) q.setNote.run(req.user.id, target.id, note);
+  else q.deleteNote.run(req.user.id, target.id);
+  dispatchToUser(req.user.id, 'USER_NOTE_UPDATE', { id: target.id, note });
+  res.status(204).end();
+});
+
+api.get('/users/@me/notes/:userId', (req, res) => {
+  const row = q.note.get(req.user.id, req.params.userId);
+  if (!row) fail(404, 'Nota não encontrada.');
+  res.json({ note_user_id: req.params.userId, note: row.note });
+});
+
+// Perfil completo (modal): servidores e amigos em comum. Só de quem tem alguma ligação com você.
+api.get('/users/:userId/profile', (req, res) => {
+  const target = q.userById.get(req.params.userId);
+  if (!target || (target.id !== req.user.id && !relatedUserIds(req.user.id).has(target.id) && !q.relationship.get(req.user.id, target.id))) {
+    fail(404, 'Usuário não encontrado.');
+  }
+  const isMe = target.id === req.user.id;
+  res.json({
+    user: publicUser(target),
+    mutual_guilds: isMe ? [] : q.mutualGuilds.all(target.id, req.user.id).map((g) => ({ id: g.id, nick: g.nick ?? null })),
+    mutual_friends: isMe ? [] : q.mutualFriends.all(req.user.id, target.id).map((r) => publicUser(q.userById.get(r.id))),
+  });
 });
 
 // --- mensagens diretas ---
@@ -408,6 +446,9 @@ const AUDIT = {
   MESSAGE_DELETE: 72,
   MESSAGE_PIN: 74,
   MESSAGE_UNPIN: 75,
+  THREAD_CREATE: 110,
+  THREAD_UPDATE: 111,
+  THREAD_DELETE: 112,
 };
 const AUDIT_ACTIONS = new Set(Object.values(AUDIT));
 
@@ -554,6 +595,7 @@ function removeMember(guild, userId) {
   disconnectVoice((v) => v.guild_id === guild.id && v.user_id === userId);
   const user = q.userById.get(userId);
   q.deleteMember.run(guild.id, userId);
+  q.leaveGuildThreads.run(userId, guild.id);
   forgetGuild(userId, guild.id);
   dispatchToGuild(guild.id, 'GUILD_MEMBER_REMOVE', { guild_id: guild.id, user: publicUser(user) });
   dispatchToUser(userId, 'GUILD_DELETE', { id: guild.id });
@@ -566,15 +608,70 @@ api.delete('/users/@me/guilds/:guildId', (req, res) => {
   res.status(204).end();
 });
 
-// Ordem dos servidores na barra lateral (guild_positions das configurações do Discord).
+// Status personalizado: { text, emoji_name, expires_at } ou null. Some sozinho quando vence.
+const MAX_CUSTOM_STATUS = 128;
+const statusTimers = new Map(); // userId -> timer do vencimento
+
+function parseCustomStatus(raw) {
+  if (raw === null) return null;
+  if (typeof raw !== 'object') fail(400, 'Status personalizado inválido.');
+  const text = String(raw.text ?? '').trim();
+  if (text.length > MAX_CUSTOM_STATUS) fail(400, `O status pode ter no máximo ${MAX_CUSTOM_STATUS} caracteres.`);
+  const emoji = raw.emoji_name ? String(raw.emoji_name) : null;
+  if (emoji && (emoji.length > 32 || !EMOJI.test(emoji))) fail(400, 'Emoji inválido.');
+  let expires = null;
+  if (raw.expires_at) {
+    expires = new Date(raw.expires_at);
+    if (Number.isNaN(expires.getTime()) || expires.getTime() <= Date.now()) fail(400, 'Data de expiração inválida.');
+    expires = expires.toISOString();
+  }
+  return text || emoji ? { text: text || null, emoji_name: emoji, expires_at: expires } : null;
+}
+
+function scheduleStatusExpiry(userId, custom) {
+  clearTimeout(statusTimers.get(userId));
+  statusTimers.delete(userId);
+  if (!custom?.expires_at) return;
+  const wait = Math.min(Date.parse(custom.expires_at) - Date.now(), 2 ** 31 - 1);
+  statusTimers.set(userId, setTimeout(() => {
+    statusTimers.delete(userId);
+    const user = q.userById.get(userId);
+    if (!user?.custom_status) return;
+    if (customStatusOf(user)) return scheduleStatusExpiry(userId, JSON.parse(user.custom_status)); // espera longa: reagenda
+    q.setCustomStatus.run(null, userId);
+    dispatchToUser(userId, 'USER_SETTINGS_UPDATE', { custom_status: null });
+    broadcastPresence(userId);
+  }, Math.max(wait, 0)).unref());
+}
+
+// Ao subir: limpa os vencidos e agenda os outros.
+for (const row of q.withCustomStatus.all()) {
+  const custom = customStatusOf(row);
+  if (custom) scheduleStatusExpiry(row.id, custom);
+  else q.setCustomStatus.run(null, row.id);
+}
+
+// Configurações sincronizadas: ordem dos servidores na barra (guild_positions) e status personalizado.
 api.patch('/users/@me/settings', (req, res) => {
-  const positions = req.body?.guild_positions;
-  if (!Array.isArray(positions) || positions.length > 200) fail(400, 'Formato inválido.');
-  const mine = new Set(q.guildsOf.all(req.user.id).map((g) => g.id));
-  const list = [...new Set(positions.map(String))].filter((id) => mine.has(id));
-  q.setGuildPositions.run(JSON.stringify(list), req.user.id);
-  dispatchToUser(req.user.id, 'USER_SETTINGS_UPDATE', { guild_positions: list });
-  res.json({ guild_positions: list });
+  const body = req.body ?? {};
+  if (body.guild_positions === undefined && body.custom_status === undefined) fail(400, 'Nada para alterar.');
+  const update = {};
+  if (body.guild_positions !== undefined) {
+    const positions = body.guild_positions;
+    if (!Array.isArray(positions) || positions.length > 200) fail(400, 'Formato inválido.');
+    const mine = new Set(q.guildsOf.all(req.user.id).map((g) => g.id));
+    update.guild_positions = [...new Set(positions.map(String))].filter((id) => mine.has(id));
+  }
+  if (body.custom_status !== undefined) update.custom_status = parseCustomStatus(body.custom_status);
+
+  if (update.guild_positions) q.setGuildPositions.run(JSON.stringify(update.guild_positions), req.user.id);
+  if (body.custom_status !== undefined) {
+    q.setCustomStatus.run(update.custom_status && JSON.stringify(update.custom_status), req.user.id);
+    scheduleStatusExpiry(req.user.id, update.custom_status);
+  }
+  dispatchToUser(req.user.id, 'USER_SETTINGS_UPDATE', update);
+  if (body.custom_status !== undefined) broadcastPresence(req.user.id);
+  res.json(update);
 });
 
 // --- canais ---
@@ -738,6 +835,7 @@ function loadGuildChannel(req) {
 }
 
 api.patch('/channels/:channelId', (req, res) => {
+  if (q.channel.get(req.params.channelId)?.type === CHANNEL_THREAD) return updateThread(req, res);
   if (q.channel.get(req.params.channelId)?.type === CHANNEL_GROUP_DM) {
     const group = loadGroup(req);
     const name = String(req.body?.name ?? '').trim();
@@ -788,6 +886,7 @@ api.patch('/channels/:channelId', (req, res) => {
 });
 
 api.delete('/channels/:channelId', (req, res) => {
+  if (q.channel.get(req.params.channelId)?.type === CHANNEL_THREAD) return deleteThread(req, res);
   if (q.channel.get(req.params.channelId)?.type === CHANNEL_GROUP_DM) {
     removeFromGroup(loadGroup(req), req.user, req.user.id);
     return res.status(204).end();
@@ -798,6 +897,7 @@ api.delete('/channels/:channelId', (req, res) => {
   const children = q.channelsOf.all(guild.id).filter((c) => c.parent_id === channel.id).map((c) => c.id);
   disconnectVoice((v) => v.channel_id === channel.id);
   db.transaction(() => {
+    q.deleteThreadsOf.run(channel.id); // as conversas do canal vão junto
     q.orphanChildren.run(channel.id);
     q.clearSystemChannel.run(channel.id);
     q.deleteChannel.run(channel.id);
@@ -807,6 +907,145 @@ api.delete('/channels/:channelId', (req, res) => {
   syncChannels(guild.id, children);
   res.status(204).end();
 });
+
+// --- conversas (threads públicas, tipo 11) ---
+
+// Durações de arquivamento automático do Discord, em minutos: 1 hora, 24 horas, 3 dias e 1 semana.
+const ARCHIVE_DURATIONS = [60, 1440, 4320, 10080];
+const THREAD_AUDIT_KEYS = ['name', 'archived', 'locked', 'auto_archive_duration'];
+
+// O clone não tem os bits de 64 bits do Discord (CREATE_PUBLIC_THREADS, MANAGE_THREADS…): criar e
+// falar em conversas segue "Enviar mensagens"; gerenciá-las, "Gerenciar mensagens" ou "Gerenciar canais".
+const canManageThreads = (perms) => has(perms, P.MANAGE_MESSAGES) || has(perms, P.MANAGE_CHANNELS);
+
+const auditThread = (t) => ({ ...t, archived: !!t.archived, locked: !!t.locked });
+
+function threadName(raw) {
+  const name = String(raw ?? '').trim();
+  if (name.length < 1 || name.length > 100) fail(400, 'Nome da conversa: 1 a 100 caracteres.');
+  return name;
+}
+
+function archiveDuration(raw) {
+  if (raw === undefined) return 1440;
+  const value = Number(raw);
+  if (!ARCHIVE_DURATIONS.includes(value)) fail(400, 'Duração de arquivamento inválida.');
+  return value;
+}
+
+function addThreadMember(thread, userId) {
+  if (q.threadMember.get(thread.id, userId)) return false;
+  q.addThreadMember.run(thread.id, userId, now());
+  return true;
+}
+
+// Canal de texto em que a conversa nasce, com as permissões de quem cria.
+function loadThreadParent(req) {
+  const parent = loadChannel(req);
+  if (parent.type !== CHANNEL_TEXT) fail(400, 'Só é possível criar conversas em canais de texto de servidor.');
+  const perms = channelPermissionsOf(parent, req.user.id);
+  if (!has(perms, P.SEND_MESSAGES)) fail(403, 'Você não tem permissão para criar conversas neste canal.');
+  return parent;
+}
+
+function createThread(req, parent, id, starter) {
+  const name = threadName(req.body?.name);
+  const duration = archiveDuration(req.body?.auto_archive_duration);
+  db.transaction(() => {
+    q.insertThread.run(id, parent.guild_id, name, parent.id, req.user.id, duration, now());
+    addThreadMember({ id }, req.user.id);
+  })();
+  const thread = q.channel.get(id);
+  audit(parent.guild_id, req.user.id, AUDIT.THREAD_CREATE, { target: id, changes: diff({}, auditThread(thread), THREAD_AUDIT_KEYS).filter((c) => c.new_value) });
+  syncChannels(parent.guild_id, [id]);
+  // A primeira mensagem da conversa mostra a mensagem de origem (tipo 21); sem origem, o canal
+  // ganha o aviso "Fulano iniciou uma conversa" (tipo 18).
+  if (starter) postMessage(thread, req.user, { type: MSG.THREAD_STARTER_MESSAGE, reference_id: starter.id });
+  else postMessage(parent, req.user, { type: MSG.THREAD_CREATED, content: name, meta: { thread_id: id } });
+  return toThread(q.channel.get(id));
+}
+
+// A partir de uma mensagem: a conversa tem o mesmo id da mensagem, como no Discord.
+api.post('/channels/:channelId/messages/:messageId/threads', (req, res) => {
+  const parent = loadThreadParent(req);
+  const message = loadMessage(req, parent);
+  if (!isUserMessage(message)) fail(400, 'Não é possível criar uma conversa a partir desta mensagem.');
+  if (q.channel.get(message.id)) fail(400, 'Já existe uma conversa para esta mensagem.');
+  res.status(201).json(createThread(req, parent, message.id, message));
+});
+
+api.post('/channels/:channelId/threads', (req, res) => {
+  const parent = loadThreadParent(req);
+  res.status(201).json(createThread(req, parent, snowflake(), null));
+});
+
+// Conversa que o usuário vê, com as permissões dele no canal de origem.
+function loadThread(req) {
+  const thread = loadChannel(req);
+  if (thread.type !== CHANNEL_THREAD) fail(404, 'Conversa não encontrada.');
+  return { thread, perms: channelPermissionsOf(thread, req.user.id) };
+}
+
+// Renomear, arquivar e mudar o arquivamento: quem criou ou quem gerencia. Bloquear: só quem gerencia.
+function updateThread(req, res) {
+  const { thread, perms } = loadThread(req);
+  const manager = canManageThreads(perms);
+  if (thread.owner_id !== req.user.id && !manager) fail(403, 'Você não tem permissão para editar esta conversa.');
+  const body = req.body ?? {};
+  if (body.locked !== undefined && !manager) fail(403, 'Só quem gerencia mensagens pode bloquear conversas.');
+  if (thread.locked && !manager) fail(403, 'Esta conversa está bloqueada.');
+
+  const next = {
+    ...thread,
+    name: body.name === undefined ? thread.name : threadName(body.name),
+    archived: body.archived === undefined ? thread.archived : body.archived ? 1 : 0,
+    locked: body.locked === undefined ? thread.locked : body.locked ? 1 : 0,
+    auto_archive_duration: body.auto_archive_duration === undefined ? thread.auto_archive_duration : archiveDuration(body.auto_archive_duration),
+  };
+  if (next.archived !== thread.archived) next.archive_timestamp = now();
+  q.updateThread.run(next.name, next.archived, next.locked, next.auto_archive_duration, next.archive_timestamp, thread.id);
+  const changes = diff(auditThread(thread), auditThread(next), THREAD_AUDIT_KEYS);
+  if (changes.length) audit(thread.guild_id, req.user.id, AUDIT.THREAD_UPDATE, { target: thread.id, changes });
+  syncChannels(thread.guild_id, [thread.id]);
+  res.json(toThread(q.channel.get(thread.id)));
+}
+
+function deleteThread(req, res) {
+  const { thread, perms } = loadThread(req);
+  if (!canManageThreads(perms)) fail(403, 'Você não tem permissão para excluir esta conversa.');
+  q.deleteChannel.run(thread.id);
+  audit(thread.guild_id, req.user.id, AUDIT.THREAD_DELETE, { target: thread.id, changes: diff(auditThread(thread), {}, ['name']) });
+  syncChannels(thread.guild_id);
+  res.status(204).end();
+}
+
+// Entrar e sair da conversa (quem participa a vê na barra lateral).
+api.put('/channels/:channelId/thread-members/@me', (req, res) => {
+  const { thread } = loadThread(req);
+  if (addThreadMember(thread, req.user.id)) syncChannels(thread.guild_id, [thread.id]);
+  res.status(204).end();
+});
+
+api.delete('/channels/:channelId/thread-members/@me', (req, res) => {
+  const { thread } = loadThread(req);
+  q.removeThreadMember.run(thread.id, req.user.id);
+  syncChannels(thread.guild_id, [thread.id]);
+  res.status(204).end();
+});
+
+// Arquivamento automático: conversa sem mensagens novas pelo tempo escolhido vai para "arquivadas".
+function archiveIdleThreads() {
+  for (const t of q.activeThreads.all()) {
+    const lastActivity = Math.max(
+      t.last_message_id ? Date.parse(timestampOf(t.last_message_id)) : 0,
+      t.archive_timestamp ? Date.parse(t.archive_timestamp) : 0,
+    );
+    if (Date.now() - lastActivity < (t.auto_archive_duration ?? 1440) * 60_000) continue;
+    q.updateThread.run(t.name, 1, t.locked, t.auto_archive_duration, now(), t.id);
+    syncChannels(t.guild_id, [t.id]);
+  }
+}
+setInterval(archiveIdleThreads, 60_000).unref();
 
 // --- cargos ---
 
@@ -1195,6 +1434,81 @@ api.get('/channels/:channelId/messages', (req, res) => {
   res.json(loadMessages(q.messagesBefore.all({ channel: channel.id, before, limit })));
 });
 
+// --- pesquisa (mesmos parâmetros de GET /guilds/:id/messages/search do Discord) ---
+
+const SEARCH_PAGE = 25;
+const LINK = /https?:\/\/\S/i;
+const ATTACHMENT_KIND = { image: /^image\//, video: /^video\//, sound: /^audio\// };
+const fold = (text) => text.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase();
+const listParam = (value) => (value === undefined ? [] : [value].flat().map(String));
+
+// Termos da pesquisa: palavras soltas ou "frases entre aspas"; todos precisam aparecer.
+const searchTerms = (content) => [...fold(content).matchAll(/"([^"]+)"|(\S+)/g)].map((m) => (m[1] ?? m[2]).trim()).filter(Boolean);
+
+function runSearch(req, res, channelIds) {
+  const query = req.query;
+  const wantedChannels = listParam(query.channel_id);
+  const channels = wantedChannels.length ? channelIds.filter((id) => wantedChannels.includes(id)) : channelIds;
+  const kinds = listParam(query.has);
+  if (kinds.some((h) => !['link', 'file', 'image', 'video', 'sound'].includes(h))) fail(400, 'Filtro "tem:" inválido.');
+  const terms = searchTerms(String(query.content ?? '')).slice(0, 20);
+  const mentionIds = listParam(query.mentions);
+  const mentionNames = mentionIds.map((id) => q.userById.get(id)?.username.toLowerCase()).filter(Boolean);
+  const offset = Math.min(Math.max(parseInt(query.offset, 10) || 0, 0), 5000);
+
+  let rows = q.searchMessages.all({
+    channels,
+    authors: listParam(query.author_id),
+    pinned: query.pinned === undefined ? null : query.pinned === 'true',
+    minId: typeof query.min_id === 'string' ? query.min_id : null,
+    maxId: typeof query.max_id === 'string' ? query.max_id : null,
+  });
+
+  if (kinds.some((h) => h !== 'link') && rows.length) {
+    const files = new Map(); // messageId -> [content_type]
+    const marks = channels.map(() => '?').join(',');
+    for (const a of db.prepare(`SELECT message_id, content_type FROM attachments WHERE message_id IS NOT NULL AND channel_id IN (${marks})`).all(...channels)) {
+      if (!files.has(a.message_id)) files.set(a.message_id, []);
+      files.get(a.message_id).push(a.content_type ?? '');
+    }
+    rows = rows.filter((m) => kinds.every((h) => h === 'link' || (h === 'file' ? files.has(m.id) : (files.get(m.id) ?? []).some((t) => ATTACHMENT_KIND[h].test(t)))));
+  }
+  if (kinds.includes('link')) rows = rows.filter((m) => LINK.test(m.content));
+  if (terms.length) rows = rows.filter((m) => {
+    const text = fold(m.content);
+    return terms.every((t) => text.includes(t));
+  });
+  if (mentionNames.length) rows = rows.filter((m) => {
+    const words = m.content.toLowerCase().split(/\s+/).map((w) => w.replace(/[^\w.@]/g, ''));
+    const replied = m.reference_id && m.reply_ping ? q.message.get(m.reference_id)?.author_id : null;
+    return mentionNames.every((name, i) => words.includes(`@${name}`) || replied === mentionIds[i]);
+  });
+  if (query.sort_order === 'asc') rows.reverse();
+
+  res.json({ total_results: rows.length, messages: loadMessages(rows.slice(offset, offset + SEARCH_PAGE)).map((m) => [m]) });
+}
+
+// Servidor: canais de texto e conversas que o usuário vê (NSFW só com include_nsfw, como no Discord).
+api.get('/guilds/:guildId/messages/search', (req, res) => {
+  const { guild } = loadGuild(req);
+  const all = q.channelsOf.all(guild.id);
+  const byId = new Map(all.map((c) => [c.id, c]));
+  const includeNsfw = req.query.include_nsfw === 'true';
+  const ids = all.filter((c) => {
+    if (c.type !== CHANNEL_TEXT && c.type !== CHANNEL_THREAD) return false;
+    const base = c.type === CHANNEL_THREAD ? byId.get(c.parent_id) : c;
+    if (!base || (base.nsfw && !includeNsfw)) return false;
+    return has(channelPermissionsOf(c, req.user.id), P.VIEW_CHANNEL);
+  }).map((c) => c.id);
+  runSearch(req, res, ids);
+});
+
+// DM ou grupo (e qualquer canal que o usuário veja).
+api.get('/channels/:channelId/messages/search', (req, res) => {
+  const channel = loadMessageChannel(req);
+  runSearch(req, res, [channel.id]);
+});
+
 // Grava e distribui uma mensagem (normal, resposta ou de sistema) no canal.
 function postMessage(channel, author, {
   content = '', type = MSG.DEFAULT, reference_id = null, reply_ping = false, meta = null, attachments = [], mention_everyone = false,
@@ -1210,6 +1524,15 @@ function postMessage(channel, author, {
 
   const message = messagePayload(id);
   dispatchToChannel(channel, 'MESSAGE_CREATE', { ...message, guild_id: channel.guild_id });
+
+  // Falar numa conversa: conta a mensagem, põe o autor como participante e desarquiva. O
+  // THREAD_UPDATE vai depois do MESSAGE_CREATE (o cliente soma a mensagem ao recebê-la).
+  if (channel.type === CHANNEL_THREAD && (type === MSG.DEFAULT || type === MSG.REPLY)) {
+    q.bumpMessageCount.run(1, channel.id);
+    const joined = addThreadMember(channel, author.id);
+    if (channel.archived) q.updateThread.run(channel.name, 0, channel.locked, channel.auto_archive_duration, now(), channel.id);
+    if (joined || channel.archived) syncChannels(channel.guild_id, [channel.id]);
+  }
   return message;
 }
 
@@ -1248,6 +1571,9 @@ api.post('/channels/:channelId/messages', (req, res) => {
   const content = String(req.body?.content ?? '').trim();
   if (!canSendIn(req, channel)) fail(403, 'Você não tem permissão para fazer isso.');
   if (isBlockedDm(req, channel)) fail(403, 'Sua mensagem não pôde ser entregue. Isso acontece quando um dos dois bloqueou o outro.');
+  if (channel.type === CHANNEL_THREAD && channel.locked && !canManageThreads(channelPermissionsOf(channel, req.user.id))) {
+    fail(403, 'Esta conversa está bloqueada. Só quem gerencia mensagens pode falar nela.');
+  }
   const attachments = claimAttachments(req, channel);
   if (content.length > 2000 || (!content && !attachments.length)) fail(400, 'A mensagem precisa ter de 1 a 2000 caracteres.');
   checkSlowmode(req, channel);
@@ -1301,6 +1627,10 @@ api.delete('/channels/:channelId/messages/:messageId', (req, res) => {
   }
   dispatchToChannel(channel, 'MESSAGE_DELETE', { id: message.id, channel_id: channel.id, guild_id: channel.guild_id });
   if (message.pinned_at) dispatchPinsUpdate(channel);
+  if (channel.type === CHANNEL_THREAD && isUserMessage(message)) {
+    q.bumpMessageCount.run(-1, channel.id);
+    syncChannels(channel.guild_id, [channel.id]);
+  }
   res.status(204).end();
 });
 

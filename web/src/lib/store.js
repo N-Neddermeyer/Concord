@@ -19,6 +19,8 @@ const initialState = () => ({
   channels: {}, // canais de servidor e DMs
   members: {}, // guildId -> { userId -> { nick, roles, joined_at } }
   presences: {}, // userId -> 'online' | 'idle' | 'dnd' | 'offline'
+  activities: {}, // userId -> status personalizado { text, emoji_name } (atividade tipo 4 da presença)
+  notes: {}, // userId -> nota pessoal sobre o usuário
   relationships: {}, // userId -> { type, since }
   voiceStates: {}, // userId -> { guild_id, channel_id, user_id, self_mute, self_deaf }
   calls: {}, // dmChannelId -> { channel_id, message_id, ringing: [userId] } (chamadas em DM)
@@ -30,6 +32,8 @@ const initialState = () => ({
   jump: null, // { channelId, messageId, nonce }: pular até uma mensagem
   slowmode: {}, // channelId -> instante (ms) em que o modo lento libera o próximo envio
   auditUpdated: {}, // guildId -> instante da última entrada nova no registro de auditoria
+  search: null, // { guildId, channelId, query, params, sort, page, nonce }: resultados à direita
+  threadPane: null, // { channelId, threadId, messageId }: conversa aberta ao lado do canal (threadId null = criando)
 
   // Estado local (salvo por usuário neste dispositivo).
   readStates: {}, // channelId -> id da última mensagem lida
@@ -121,9 +125,13 @@ function addGuild(s, g) {
     users[m.user.id] = m.user;
     members[m.user.id] = { nick: m.nick ?? null, roles: m.roles, joined_at: m.joined_at };
   }
-  for (const p of g.presences) presences[p.user_id] = p.status;
+  const activities = { ...s.activities };
+  for (const p of g.presences) {
+    presences[p.user_id] = p.status;
+    activities[p.user_id] = customStatusOf(p);
+  }
   for (const v of g.voice_states) voiceStates[v.user_id] = v;
-  for (const c of g.channels) {
+  for (const c of [...g.channels, ...(g.threads ?? [])]) {
     channels[c.id] = c;
     // Canal nunca visto neste dispositivo começa como lido.
     if (!(c.id in readStates) && c.last_message_id) readStates[c.id] = c.last_message_id;
@@ -132,6 +140,7 @@ function addGuild(s, g) {
     ...s,
     users,
     presences,
+    activities,
     voiceStates,
     channels,
     readStates,
@@ -185,6 +194,13 @@ function setMember(s, guildId, userId, member) {
 }
 
 export const isPrivate = (channel) => channel?.type === 1 || channel?.type === 3;
+export const isThread = (channel) => channel?.type === 11;
+
+// Status personalizado vindo da presença (atividade tipo 4 do Discord).
+function customStatusOf(presence) {
+  const activity = presence.activities?.find((a) => a.type === 4);
+  return activity ? { text: activity.state ?? null, emoji_name: activity.emoji?.name ?? null } : null;
+}
 
 const isMention = (s, m) => {
   if (m.referenced_message?.author.id === s.user.id && m.reply_ping) return true;
@@ -215,7 +231,10 @@ function reduce(s, { type, d }) {
         users: { [d.user.id]: d.user },
         layer: s.user?.id === d.user.id ? s.layer : null,
         guildPositions: d.user_settings?.guild_positions ?? [],
+        notes: d.notes ?? {},
       };
+      next.user = { ...d.user, custom_status: d.user_settings?.custom_status ?? null };
+      next.users = { [d.user.id]: next.user };
       next.presences = { [d.user.id]: d.user.status === 'invisible' ? 'offline' : d.user.status };
       for (const g of d.guilds) next = addGuild(next, g);
       for (const c of d.private_channels) next = addDm(next, c);
@@ -226,14 +245,18 @@ function reduce(s, { type, d }) {
         relationships[r.id] = { type: r.type, since: r.since };
       }
       const presences = { ...next.presences };
-      for (const p of d.presences) presences[p.user_id] = p.status;
+      const activities = { ...next.activities };
+      for (const p of d.presences) {
+        presences[p.user_id] = p.status;
+        activities[p.user_id] = customStatusOf(p);
+      }
       const calls = {};
       const voiceStates = { ...next.voiceStates };
       for (const { voice_states: states, ...call } of d.calls ?? []) {
         calls[call.channel_id] = call;
         for (const v of states) voiceStates[v.user_id] = v;
       }
-      next = { ...next, users, relationships, presences, calls, voiceStates };
+      next = { ...next, users, relationships, presences, activities, calls, voiceStates };
       if (next.nav.guildId !== HOME && !next.guilds[next.nav.guildId]) next.nav = { ...next.nav, guildId: HOME };
       return next;
     }
@@ -272,10 +295,16 @@ function reduce(s, { type, d }) {
     case 'CHANNEL_CREATE':
       return isPrivate(d) ? addDm(s, d) : { ...s, channels: { ...s.channels, [d.id]: d } };
 
+    // Conversas ficam junto dos canais (o chat e as permissões funcionam igual).
+    case 'THREAD_CREATE':
+    case 'THREAD_UPDATE':
+      return { ...s, channels: { ...s.channels, [d.id]: { ...s.channels[d.id], ...d } } };
+
     case 'CHANNEL_UPDATE':
       if (isPrivate(d)) return addDm(s, { ...s.channels[d.id], ...d });
       return { ...s, channels: { ...s.channels, [d.id]: { ...s.channels[d.id], ...d } } };
 
+    case 'THREAD_DELETE':
     case 'CHANNEL_DELETE': {
       // Saiu (ou foi removido) de um grupo aberto: volta para Amigos.
       const nav = s.nav.channels[HOME] === d.id ? { ...s.nav, channels: { ...s.nav.channels, [HOME]: null } } : s.nav;
@@ -286,6 +315,7 @@ function reduce(s, { type, d }) {
         messages: without(s.messages, d.id),
         calls: without(s.calls, d.id),
         layer: s.layer?.channelId === d.id ? null : s.layer,
+        threadPane: s.threadPane && [s.threadPane.channelId, s.threadPane.threadId].includes(d.id) ? null : s.threadPane,
       };
     }
 
@@ -305,7 +335,14 @@ function reduce(s, { type, d }) {
       return { ...s, pinsUpdated: { ...s.pinsUpdated, [d.channel_id]: Date.now() } };
 
     case 'PRESENCE_UPDATE':
-      return { ...s, presences: { ...s.presences, [d.user_id]: d.status } };
+      return {
+        ...s,
+        presences: { ...s.presences, [d.user_id]: d.status },
+        activities: { ...s.activities, [d.user_id]: customStatusOf(d) },
+      };
+
+    case 'USER_NOTE_UPDATE':
+      return { ...s, notes: d.note ? { ...s.notes, [d.id]: d.note } : without(s.notes, d.id) };
 
     case 'USER_UPDATE':
       if (d.id === s.user.id) return { ...s, user: { ...s.user, ...d }, users: { ...s.users, [d.id]: { ...s.users[d.id], ...d } } };
@@ -313,8 +350,10 @@ function reduce(s, { type, d }) {
 
     case 'USER_SETTINGS_UPDATE': {
       const { guild_positions: positions, ...settings } = d;
-      if (!positions) return { ...s, user: { ...s.user, ...settings } };
-      return { ...s, user: { ...s.user, ...settings }, guildPositions: positions, guildOrder: orderGuilds(s.guildOrder, positions) };
+      const user = { ...s.user, ...settings };
+      const users = { ...s.users, [user.id]: { ...s.users[user.id], ...settings } };
+      if (!positions) return { ...s, user, users };
+      return { ...s, user, users, guildPositions: positions, guildOrder: orderGuilds(s.guildOrder, positions) };
     }
 
     // Ordem nova arrastando na barra: aplica na hora (o servidor confirma com USER_SETTINGS_UPDATE).
@@ -371,7 +410,11 @@ function reduce(s, { type, d }) {
     case 'MESSAGE_CREATE': {
       const channel = s.channels[d.channel_id];
       if (!channel) return s;
-      let next = { ...s, channels: { ...s.channels, [channel.id]: { ...channel, last_message_id: d.id } } };
+      // Conversa: conta a mensagem e guarda a última para a prévia (o THREAD_UPDATE confirma depois).
+      const counted = isThread(channel) && (d.type === 0 || d.type === 19)
+        ? { message_count: (channel.message_count ?? 0) + 1, last_message: d }
+        : null;
+      let next = { ...s, channels: { ...s.channels, [channel.id]: { ...channel, last_message_id: d.id, ...counted } } };
 
       const entry = s.messages[d.channel_id];
       if (entry && !entry.list.some((m) => m.id === d.id)) {
@@ -480,6 +523,18 @@ function reduce(s, { type, d }) {
 
     case 'TOGGLE_MEMBERS':
       return { ...s, showMembers: !s.showMembers };
+
+    case 'SEARCH_OPEN':
+      return { ...s, search: { ...d, page: d.page ?? 0, nonce: Date.now() }, threadPane: null };
+
+    case 'SEARCH_CLOSE':
+      return { ...s, search: null };
+
+    case 'THREAD_PANE_OPEN':
+      return { ...s, threadPane: d, search: null };
+
+    case 'THREAD_PANE_CLOSE':
+      return { ...s, threadPane: null };
 
     case 'OPEN_LAYER':
       return { ...s, layer: d };

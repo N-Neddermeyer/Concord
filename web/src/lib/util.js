@@ -47,3 +47,10 @@ export function alpha(hex, a) {
 
 // Instante (ISO) embutido num Snowflake: 42 bits de milissegundos desde 2015-01-01.
 export const snowflakeTime = (id) => new Date(Number((BigInt(id) >> 22n) + 1420070400000n)).toISOString();
+
+// Arquivamento automático das conversas (minutos), como nas opções do Discord.
+export const ARCHIVE_OPTIONS = [[60, '1 hora'], [1440, '24 horas'], [4320, '3 dias'], [10080, '1 semana']];
+export const archiveLabel = (minutes) => ARCHIVE_OPTIONS.find(([m]) => m === minutes)?.[1] ?? `${minutes} minutos`;
+
+// Snowflake do instante (para os filtros de data da pesquisa: min_id / max_id).
+export const snowflakeAt = (ms) => String((BigInt(Math.max(ms, 1420070400000)) - 1420070400000n) << 22n);

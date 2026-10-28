@@ -62,6 +62,19 @@ não libera esses dispositivos (exige HTTPS); use o app desktop.
   Excluir e Copiar ID. "(editado)", reações embaixo da mensagem, resposta com a mensagem citada,
   "Mensagens fixadas" no cabeçalho (com "Pular") e mensagem de sistema "fixou uma mensagem".
   Fora de propósito: Apps, Falar mensagem e Denunciar.
+- **Conversas (threads)**: "Criar conversa" na barra da mensagem ou no menu (a conversa tem o mesmo id
+  da mensagem, como no Discord) ou pelo botão "Conversas" do cabeçalho (sem mensagem de origem: o canal
+  ganha o aviso "iniciou uma conversa"). Abre num painel ao lado do canal ou em tela cheia (pela barra
+  lateral), prévia embaixo da mensagem com contagem e última mensagem, lista de conversas ativas e
+  arquivadas, conversas de que você participa embaixo do canal na barra lateral. Entrar/sair, editar
+  nome, arquivar (também automático após 1 hora, 24 horas, 3 dias ou 1 semana sem mensagens; mandar
+  mensagem desarquiva), bloquear e excluir. Seguem as permissões do canal de origem.
+- **Pesquisa**: caixa "Buscar" no cabeçalho do canal e da DM com os filtros do Discord em português
+  (`de:`, `menciona:`, `tem:` link/arquivo/imagem/vídeo/som, `antes:`, `durante:`, `depois:`
+  (dd/mm/aaaa, hoje, ontem), `em:` canal ou conversa, `fixado:` sim/não) e sugestões enquanto digita.
+  Não diferencia acentos e aceita "frases entre aspas". Resultados à direita, agrupados por canal,
+  mais recentes ou mais antigos, 25 por página; clicar pula até a mensagem. Só procura nos canais que
+  você vê; NSFW só ao filtrar um canal com restrição de idade já liberado.
 - **Escrever mensagens**: markdown do Discord (negrito, itálico, sublinhado, riscado, `código`, blocos
   de código, citações `>` e `>>>`, títulos `#`, subtexto `-#`, listas, `||spoiler||`, `[texto](link)`,
   `\` para escapar) e emojis grandes quando a mensagem só tem emojis. "Fulano está digitando…"
@@ -104,7 +117,14 @@ não libera esses dispositivos (exige HTTPS); use o app desktop.
   apelido, expulsar, banir), Convites, Banimentos, Excluir servidor.
 - **Configurações do canal e da categoria**: nome, tópico, modo lento, restrição de idade,
   Permissões, excluir.
-- **Status**: Online, Ausente, Não perturbe (silencia notificações), Invisível.
+- **Status**: Online, Ausente, Não perturbe (silencia notificações), Invisível. Status personalizado
+  (emoji e texto, "Limpar após" hoje / 4 horas / 1 hora / 30 minutos / não limpar) no menu do painel do
+  usuário; aparece na lista de membros, nas DMs, nos amigos e no perfil, e some quando a pessoa está
+  offline ou invisível.
+- **Perfil**: popout com status personalizado, nota e "Ver perfil completo" (também clicando no avatar,
+  no nome da DM e em "Perfil" no clique direito do membro). O perfil completo tem Sobre mim, membro
+  desde (no app e no servidor), nota pessoal (só você vê, até 256 caracteres) e as abas de servidores
+  e amigos em comum.
 - **Voz**: mudo, ensurdecer, detecção de voz com anel verde, sons de entrar/sair.
 - **Vídeo e tela**: câmera e compartilhamento de tela na chamada de DM/grupo e no canal de voz do
   servidor (que abre na área principal com a grade de participantes). Botão de chamada de vídeo no
@@ -156,6 +176,10 @@ Só imagem, vídeo e áudio abrem no navegador; os demais tipos são sempre serv
 - Voz P2P em malha: boa para poucas pessoas na mesma rede. Para mais gente, troque por um SFU (LiveKit, mediasoup).
 - Sem STUN/TURN: funciona em `localhost` e na rede local, não pela internet.
 - Sem emojis personalizados. Blocos de código sem cores de sintaxe.
+- Conversas: só as públicas (sem conversas privadas nem canais de fórum). O clone não tem os bits de
+  permissão de 64 bits do Discord, então criar e falar em conversas segue "Enviar mensagens", e
+  gerenciá-las (bloquear, excluir, editar as dos outros) segue "Gerenciar mensagens" ou "Gerenciar canais".
+- Pesquisa sem ordenação por relevância e sem `tem: incorporação` (não há prévia de links).
 - Permissões de voz além de "Conectar" (falar, vídeo, mutar outros) não existem: a mídia é P2P e
   o servidor não teria como impor. Convites são do servidor, não de um canal.
 - Vídeo em malha: cada um envia sua câmera/tela para cada participante, então pesa com muita gente.

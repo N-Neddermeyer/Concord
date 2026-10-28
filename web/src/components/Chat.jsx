@@ -1,11 +1,13 @@
-import { AtSign, File, FileCode, FileImage, FileText, Phone, Pin, Timer, TriangleAlert, UserPlus, Users, Video, X } from 'lucide-react';
+import {
+  Archive, AtSign, ChevronRight, Ellipsis, File, FileCode, FileImage, FileText, Lock, Phone, Pin, Timer, TriangleAlert, UserPlus, Users, Video, X,
+} from 'lucide-react';
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../lib/api.js';
 import { useCallLayout } from '../lib/callLayout.js';
 import { acceptCall, startCall, startVideoCall } from '../lib/calls.js';
-import { openPopout, showError, useDialogs } from '../lib/dialogs.js';
+import { openMenu, openPopout, showError, useDialogs } from '../lib/dialogs.js';
 import { isUserMessage } from '../lib/messages.js';
-import { P, channelPermissionsFor, has, memberColor } from '../lib/permissions.js';
+import { P, canManageThreads, channelPermissionsFor, has, memberColor } from '../lib/permissions.js';
 import { useSettings } from '../lib/settings.js';
 import { HOME, REL, dispatch, dmRecipient, isPrivate, memberName, navigate, privateChannelName, useStore } from '../lib/store.js';
 import { useTypingUsers } from '../lib/typing.js';
@@ -19,6 +21,9 @@ import { ChannelIcon } from './ChannelSidebar.jsx';
 import Composer, { lastOwnMessage, useCooldown } from './Composer.jsx';
 import Message, { openReactionPicker } from './Message.jsx';
 import PinsPopout from './PinsPopout.jsx';
+import { openProfile } from './UserProfile.jsx';
+import { SearchBox } from './Search.jsx';
+import { ThreadIcon, ThreadsPopout, openThread, startThread, threadMenuItems } from './Threads.jsx';
 
 const PAGE_SIZE = 50;
 const GROUP_WINDOW_MS = 7 * 60 * 1000;
@@ -72,9 +77,12 @@ function GroupName({ channel, name }) {
   );
 }
 
-export default function Chat({ channelId }) {
+// `pane`: conversa aberta no painel ao lado do canal (cabeçalho compacto, sem pesquisa).
+export default function Chat({ channelId, pane = false }) {
   const channel = useStore((s) => s.channels[channelId]);
   const guildId = channel.guild_id;
+  const guildName = useStore((s) => s.guilds[guildId]?.name);
+  const parent = useStore((s) => (channel.type === 11 ? s.channels[channel.parent_id] : null));
   const entry = useStore((s) => s.messages[channelId]);
   const me = useStore((s) => s.user);
   const users = useStore((s) => s.users);
@@ -110,13 +118,19 @@ export default function Chat({ channelId }) {
   const restoreFrom = useRef(null); // altura antes de carregar mensagens antigas
   const pinButton = useRef(null);
   const addButton = useRef(null);
+  const threadsButton = useRef(null);
 
   const isPrivateChannel = isPrivate(channel);
   const isDm = channel.type === 1;
   const isGroup = channel.type === 3;
   const recipient = isDm ? dmRecipient(state, channel) : null;
   const blocked = isDm && relationships[recipient.id]?.type === REL.BLOCKED;
-  const canSend = isPrivateChannel ? !blocked : has(perms, P.SEND_MESSAGES);
+  // Conversa: arquivada ainda aceita mensagem (desarquiva); bloqueada, só de quem gerencia.
+  const isThreadChannel = channel.type === 11;
+  const threadMeta = channel.thread_metadata ?? {};
+  const threadManager = canManageThreads(perms);
+  const threadLocked = isThreadChannel && threadMeta.locked && !threadManager;
+  const canSend = isPrivateChannel ? !blocked : has(perms, P.SEND_MESSAGES) && !threadLocked;
   const canManage = has(perms, P.MANAGE_MESSAGES);
   const canAttach = isPrivateChannel || has(perms, P.ATTACH_FILES);
   const canReact = isPrivateChannel || has(perms, P.ADD_REACTIONS);
@@ -281,6 +295,11 @@ export default function Chat({ channelId }) {
     onOpenPins: () => openFloating(PinsPopout, { channel, canPin }, pinButton),
     onJoinCall: () => acceptCall(channelId),
     openPicker: openReactionPicker,
+    threadOf: (id) => (id && channels[id]?.type === 11 ? channels[id] : null),
+    canCreateThread: channel.type === 0 && has(perms, P.SEND_MESSAGES),
+    onCreateThread: (message) => startThread(channelId, message.id),
+    onOpenThread: (thread) => openThread(thread, channelId),
+    onOpenThreads: () => threadsButton.current && openFloating(ThreadsPopout, { channel }, threadsButton),
   };
 
   const firstUnread = unreadMarker
@@ -293,7 +312,7 @@ export default function Chat({ channelId }) {
         <div className="drop-overlay">
           <div className="drop-box">
             <div className="drop-icons"><FileText size={40} /><FileImage size={48} /><FileCode size={40} /></div>
-            <h2>Enviar para <b>{isDm ? `@${title}` : isGroup ? title : `#${title}`}</b></h2>
+            <h2>Enviar para <b>{isDm ? `@${title}` : isGroup || isThreadChannel ? title : `#${title}`}</b></h2>
             <p>Você pode adicionar comentários antes de enviar. Segure Shift para enviar diretamente.</p>
           </div>
         </div>
@@ -302,7 +321,7 @@ export default function Chat({ channelId }) {
         {isDm && (
           <>
             <Avatar user={recipient} size={24} status={presences[recipient.id] ?? 'offline'} />
-            <h1>{title}</h1>
+            <button className="header-name-button" title="Ver perfil" onClick={() => openProfile(recipient.id)}><h1>{title}</h1></button>
             <span className="header-status">{STATUS_LABELS[presences[recipient.id] ?? 'offline']}</span>
           </>
         )}
@@ -312,7 +331,24 @@ export default function Chat({ channelId }) {
             <GroupName channel={channel} name={title} />
           </>
         )}
-        {!isPrivateChannel && (
+        {isThreadChannel && (
+          <>
+            {!pane && parent && (
+              <>
+                <button className="header-parent" onClick={() => navigate(guildId, parent.id)} title={`Ir para #${parent.name}`}>
+                  <ChannelIcon channel={parent} size={20} className="header-icon" />
+                  <span>{parent.name}</span>
+                </button>
+                <ChevronRight size={16} className="header-icon" />
+              </>
+            )}
+            <ThreadIcon size={22} className="header-icon" />
+            <h1 className="header-thread-name">{title}</h1>
+            {threadMeta.archived && <span className="thread-tag" title="Arquivada"><Archive size={12} /> Arquivada</span>}
+            {threadMeta.locked && <span className="thread-tag" title="Bloqueada"><Lock size={12} /> Bloqueada</span>}
+          </>
+        )}
+        {!isPrivateChannel && !isThreadChannel && (
           <>
             <ChannelIcon channel={channel} size={24} className="header-icon" />
             <h1>{title}</h1>
@@ -342,6 +378,11 @@ export default function Chat({ channelId }) {
             </button>
           </>
         )}
+        {channel.type === 0 && (
+          <button ref={threadsButton} className="header-button" aria-label="Conversas" title="Conversas" onClick={ctx.onOpenThreads}>
+            <ThreadIcon size={22} />
+          </button>
+        )}
         <button ref={pinButton} className="header-button" aria-label="Mensagens fixadas" title="Mensagens fixadas" onClick={ctx.onOpenPins}>
           <Pin size={22} />
         </button>
@@ -357,7 +398,17 @@ export default function Chat({ channelId }) {
             <UserPlus size={22} />
           </button>
         )}
-        {(isGroup || !isPrivateChannel) && (
+        {isThreadChannel && (
+          <button
+            className="header-button"
+            aria-label="Mais"
+            title="Mais"
+            onClick={(e) => openMenu({ rect: e.currentTarget.getBoundingClientRect(), side: 'below-end', items: threadMenuItems(channel, state, { inPane: pane }) })}
+          >
+            <Ellipsis size={22} />
+          </button>
+        )}
+        {(isGroup || !isPrivateChannel) && !pane && (
           <button
             className={`header-button${showMembers ? ' active' : ''}`}
             aria-label={showMembers ? 'Ocultar lista de membros' : 'Mostrar lista de membros'}
@@ -366,6 +417,17 @@ export default function Chat({ channelId }) {
           >
             <Users size={22} />
           </button>
+        )}
+        {pane && (
+          <button className="header-button" aria-label="Fechar conversa" title="Fechar" onClick={() => dispatch({ type: 'THREAD_PANE_CLOSE' })}>
+            <X size={22} />
+          </button>
+        )}
+        {!pane && (
+          <SearchBox
+            scope={guildId ? { guildId } : { channelId }}
+            placeholder={guildId ? `Buscar em ${guildName}` : 'Buscar'}
+          />
         )}
       </header>
 
@@ -390,7 +452,14 @@ export default function Chat({ channelId }) {
                 <p>Boas-vindas ao início do grupo <b>{title}</b>.</p>
               </>
             )}
-            {!isPrivateChannel && (
+            {isThreadChannel && (
+              <>
+                <div className="start-icon"><ThreadIcon size={36} /></div>
+                <h2>{channel.name}</h2>
+                <p>Iniciada por <b>{nameOf(channel.owner_id)}</b></p>
+              </>
+            )}
+            {!isPrivateChannel && !isThreadChannel && (
               <>
                 <div className="start-icon"><ChannelIcon channel={channel} size={44} className="" /></div>
                 <h2>Boas-vindas a #{channel.name}!</h2>
@@ -440,10 +509,18 @@ export default function Chat({ channelId }) {
             <button className="reply-close" aria-label="Cancelar resposta" onClick={() => setReplyTo(null)}><X size={16} /></button>
           </div>
         )}
+        {isThreadChannel && (threadMeta.archived || threadMeta.locked) && (
+          <div className="thread-status-bar">
+            {threadMeta.locked ? <Lock size={16} /> : <Archive size={16} />}
+            {threadMeta.locked
+              ? (threadManager ? 'Esta conversa está bloqueada. Você ainda pode falar nela porque gerencia mensagens.' : 'Esta conversa está bloqueada.')
+              : 'Esta conversa está arquivada. Envie uma mensagem para desarquivá-la.'}
+          </div>
+        )}
         {canSend ? (
           <Composer
             channel={channel}
-            placeholder={isDm ? `Conversar com @${title}` : isGroup ? `Conversar em ${title}` : `Conversar em #${title}`}
+            placeholder={isDm ? `Conversar com @${title}` : isGroup || isThreadChannel ? `Conversar em ${title}` : `Conversar em #${title}`}
             replyTo={replyTo}
             onClearReply={() => setReplyTo(null)}
             onRestoreReply={setReplyTo}
@@ -461,7 +538,9 @@ export default function Chat({ channelId }) {
           />
         ) : (
           <div className="composer-box disabled">
-            {blocked ? 'Você não pode enviar mensagens para um usuário que você bloqueou.' : 'Você não tem permissão para enviar mensagens neste canal.'}
+            {blocked ? 'Você não pode enviar mensagens para um usuário que você bloqueou.'
+              : threadLocked ? 'Esta conversa está bloqueada. Só quem gerencia mensagens pode falar nela.'
+              : 'Você não tem permissão para enviar mensagens neste canal.'}
           </div>
         )}
         <div className="composer-footer">

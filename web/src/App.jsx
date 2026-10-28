@@ -10,9 +10,11 @@ import MemberList from './components/MemberList.jsx';
 import DialogHost from './components/Modal.jsx';
 import { QuickSwitcher } from './components/modals.jsx';
 import PrivateSidebar from './components/PrivateSidebar.jsx';
+import { SearchResults } from './components/Search.jsx';
 import ChannelSettings from './components/settings/ChannelSettings.jsx';
 import GuildSettings from './components/settings/GuildSettings.jsx';
 import UserSettings from './components/settings/UserSettings.jsx';
+import { ThreadPane } from './components/Threads.jsx';
 import TitleBar from './components/TitleBar.jsx';
 import UserPanel, { VoicePanel } from './components/UserPanel.jsx';
 import VoiceChannelView from './components/VoiceChannelView.jsx';
@@ -105,7 +107,7 @@ function useShortcuts() {
 
 function Main({ onLogout, onToken }) {
   const state = useStore((s) => s);
-  const { nav, guilds, channels, connection, layer, showMembers } = state;
+  const { nav, guilds, channels, connection, layer, showMembers, search, threadPane } = state;
   useShortcuts();
 
   const guildId = nav.guildId === HOME || guilds[nav.guildId] ? nav.guildId : HOME;
@@ -115,17 +117,21 @@ function Main({ onLogout, onToken }) {
   let channelId = nav.channels[guildId] ?? null;
   if (channelId && !channels[channelId]) channelId = null;
   if (!isHome && !channelId) channelId = firstTextChannel(channels, guildId)?.id ?? null;
-  if (!isHome && ![0, 2].includes(channels[channelId]?.type)) channelId = null;
+  if (!isHome && ![0, 2, 11].includes(channels[channelId]?.type)) channelId = null;
 
   const channel = channels[channelId];
   const isVoice = channel?.type === 2;
+  const isThread = channel?.type === 11;
+  // À direita do chat: a pesquisa ou a conversa aberta ao lado; senão a lista de membros.
+  const searchOpen = !!search && (isHome ? !!channel && search.channelId === channelId : search.guildId === guildId);
+  const paneOpen = !searchOpen && !!threadPane && !!channel && threadPane.channelId === channelId;
   const title = isHome
     ? (channel ? privateChannelName(state, channel) : 'Amigos')
     : guilds[guildId].name;
 
   useEffect(() => {
-    document.title = channel && !isHome ? `${isVoice ? '' : '#'}${channel.name} | ${guilds[guildId].name}` : title;
-  }, [title, channel, isHome, isVoice, guilds, guildId]);
+    document.title = channel && !isHome ? `${isVoice || isThread ? '' : '#'}${channel.name} | ${guilds[guildId].name}` : title;
+  }, [title, channel, isHome, isVoice, isThread, guilds, guildId]);
 
   return (
     <div className="app-shell">
@@ -148,8 +154,12 @@ function Main({ onLogout, onToken }) {
           {channel && !isVoice && <Chat key={channelId} channelId={channelId} />}
           {isVoice && <VoiceChannelView key={channelId} channelId={channelId} />}
           {!isHome && !channel && <NoTextChannel />}
-          {!isHome && showMembers && channel && !isVoice && <MemberList guildId={guildId} />}
-          {isHome && showMembers && channel?.type === 3 && <GroupMembers channel={channel} />}
+          {paneOpen && <ThreadPane />}
+          {searchOpen && <SearchResults />}
+          {!searchOpen && !paneOpen && !isHome && showMembers && channel && !isVoice && (
+            <MemberList guildId={guildId} only={isThread ? channel.member_ids ?? [] : null} />
+          )}
+          {!searchOpen && isHome && showMembers && channel?.type === 3 && <GroupMembers channel={channel} />}
         </div>
       </div>
 

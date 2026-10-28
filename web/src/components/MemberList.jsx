@@ -5,8 +5,10 @@ import { copyText } from '../lib/messages.js';
 import { P, has, hoistedRole, memberColor, permissionsFor, rankOf } from '../lib/permissions.js';
 import { memberName, useStore } from '../lib/store.js';
 import Avatar from './Avatar.jsx';
+import { CustomStatus } from './CustomStatus.jsx';
 import { BanModal, NicknameModal } from './modals.jsx';
 import { openDm } from './UserPopout.jsx';
+import { openProfile } from './UserProfile.jsx';
 
 // Clique direito num membro: perfil, mensagem, apelido e moderação, conforme as permissões.
 export function openMemberMenu(e, state, guildId, userId) {
@@ -34,7 +36,7 @@ export function openMemberMenu(e, state, guildId, userId) {
     rect,
     side: 'right',
     items: [
-      { label: 'Perfil', onClick: () => openPopout({ userId, guildId, rect, side: 'left' }) },
+      { label: 'Perfil', onClick: () => openProfile(userId, guildId) },
       !isMe && { label: 'Mensagem', icon: MessageCircle, onClick: () => openDm(userId) },
       canNick && { separator: true },
       canNick && { label: isMe ? 'Editar perfil do servidor' : 'Alterar apelido', icon: Pencil, onClick: () => openModal(NicknameModal, { guildId, userId }) },
@@ -49,8 +51,11 @@ export function openMemberMenu(e, state, guildId, userId) {
 
 // Como no Discord: membros online agrupados pelo cargo "exibir separadamente" mais alto,
 // depois o restante em "Online" e, por fim, "Offline".
-export default function MemberList({ guildId }) {
-  const members = useStore((s) => s.members[guildId]);
+// `only`: ids que entram na lista (membros de uma conversa).
+export default function MemberList({ guildId, only = null }) {
+  const allMembers = useStore((s) => s.members[guildId]);
+  const activities = useStore((s) => s.activities);
+  const members = only ? Object.fromEntries(Object.entries(allMembers ?? {}).filter(([id]) => only.includes(id))) : allMembers;
   const users = useStore((s) => s.users);
   const presences = useStore((s) => s.presences);
   const speaking = useStore((s) => s.speaking);
@@ -93,8 +98,13 @@ export default function MemberList({ guildId }) {
                 onContextMenu={(e) => openMemberMenu(e, state, guildId, id)}
               >
                 <Avatar user={users[id]} size={32} status={status} speaking={!!speaking[id]} />
-                <span className="member-name" style={{ color: memberColor(state, guildId, id) ?? undefined }}>{nameOf(id)}</span>
-                {id === guild.owner_id && <Crown size={14} className="owner-crown" aria-label="Dono do servidor" />}
+                <span className="member-text">
+                  <span className="member-name-row">
+                    <span className="member-name" style={{ color: memberColor(state, guildId, id) ?? undefined }}>{nameOf(id)}</span>
+                    {id === guild.owner_id && <Crown size={14} className="owner-crown" aria-label="Dono do servidor" />}
+                  </span>
+                  {status !== 'offline' && <CustomStatus status={activities[id]} className="member-activity" />}
+                </span>
               </button>
             );
           })}

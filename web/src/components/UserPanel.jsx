@@ -1,10 +1,11 @@
-import { HeadphoneOff, Headphones, Mic, MicOff, MonitorUp, PhoneOff, Settings, Signal, Video, VideoOff } from 'lucide-react';
+import { HeadphoneOff, Headphones, Mic, MicOff, MonitorUp, Pencil, PhoneOff, Settings, Signal, Smile, Video, VideoOff, X } from 'lucide-react';
 import { OP, gateway } from '../lib/gateway.js';
-import { openMenu } from '../lib/dialogs.js';
+import { openMenu, openModal } from '../lib/dialogs.js';
 import { HOME, isPrivate, navigate, openLayer, privateChannelName, useStore } from '../lib/store.js';
 import { STATUS_LABELS, displayName } from '../lib/util.js';
 import { useVoice, voice } from '../lib/voice.js';
 import Avatar from './Avatar.jsx';
+import { CustomStatus, CustomStatusModal, saveCustomStatus } from './CustomStatus.jsx';
 import { toggleScreenShare } from './VideoCall.jsx';
 
 const STATUS_OPTIONS = [
@@ -53,17 +54,28 @@ export default function UserPanel() {
   const speaking = useStore((s) => !!s.speaking[s.user.id]);
   const session = useVoice();
   const status = me.status === 'invisible' ? 'offline' : me.status;
+  const custom = me.custom_status;
 
   const chooseStatus = (e) =>
     openMenu({
       rect: e.currentTarget.getBoundingClientRect(),
       side: 'above',
       width: 260,
-      items: STATUS_OPTIONS.map(([value, hint]) => ({
-        label: hint ? <><b>{STATUS_LABELS[value]}</b><small className="menu-hint">{hint}</small></> : <b>{STATUS_LABELS[value]}</b>,
-        icon: statusIcon(value),
-        onClick: () => gateway.send(OP.PRESENCE_UPDATE, { status: value }),
-      })),
+      items: [
+        // Status personalizado no topo do menu, como no Discord.
+        ...(custom
+          ? [
+            { label: <CustomStatus status={custom} className="menu-custom-status" />, icon: Pencil, onClick: () => openModal(CustomStatusModal) },
+            { label: 'Limpar status personalizado', icon: X, onClick: () => saveCustomStatus(null) },
+          ]
+          : [{ label: 'Definir status personalizado', icon: Smile, onClick: () => openModal(CustomStatusModal) }]),
+        { separator: true },
+        ...STATUS_OPTIONS.map(([value, hint]) => ({
+          label: hint ? <><b>{STATUS_LABELS[value]}</b><small className="menu-hint">{hint}</small></> : <b>{STATUS_LABELS[value]}</b>,
+          icon: statusIcon(value),
+          onClick: () => gateway.send(OP.PRESENCE_UPDATE, { status: value }),
+        })),
+      ],
     });
 
   return (
@@ -73,7 +85,7 @@ export default function UserPanel() {
         <span className="user-panel-names">
           <span className="user-panel-display">{displayName(me)}</span>
           <span className="user-panel-sub">
-            <span className="sub-status">{STATUS_LABELS[me.status]}</span>
+            <span className="sub-status">{custom ? <CustomStatus status={custom} /> : STATUS_LABELS[me.status]}</span>
             <span className="sub-username">{me.username}</span>
           </span>
         </span>

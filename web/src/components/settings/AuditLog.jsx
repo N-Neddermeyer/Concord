@@ -1,9 +1,9 @@
-import { ChevronDown, ChevronRight, Hash, Link, Pin, Server, Shield, Trash2, UserCog, UserMinus, UserX } from 'lucide-react';
+import { ChevronDown, ChevronRight, Hash, Link, MessagesSquare, Pin, Server, Shield, Trash2, UserCog, UserMinus, UserX } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { api } from '../../lib/api.js';
 import { PERMISSION_GROUPS } from '../../lib/permissions.js';
 import { memberName, useStore } from '../../lib/store.js';
-import { displayName, formatMessageTime, snowflakeTime } from '../../lib/util.js';
+import { archiveLabel, displayName, formatMessageTime, snowflakeTime } from '../../lib/util.js';
 import Avatar from '../Avatar.jsx';
 import { slowmodeLabel } from './ChannelSettings.jsx';
 
@@ -29,6 +29,9 @@ const A = {
   MESSAGE_DELETE: 72,
   MESSAGE_PIN: 74,
   MESSAGE_UNPIN: 75,
+  THREAD_CREATE: 110,
+  THREAD_UPDATE: 111,
+  THREAD_DELETE: 112,
 };
 
 // Filtro "Filtrar por ação", na ordem do Discord.
@@ -53,6 +56,9 @@ const ACTION_FILTERS = [
   [A.MESSAGE_DELETE, 'Excluir mensagem'],
   [A.MESSAGE_PIN, 'Fixar mensagem'],
   [A.MESSAGE_UNPIN, 'Desafixar mensagem'],
+  [A.THREAD_CREATE, 'Criar conversa'],
+  [A.THREAD_UPDATE, 'Atualizar conversa'],
+  [A.THREAD_DELETE, 'Excluir conversa'],
 ];
 
 const PERMISSION_NAMES = new Map(PERMISSION_GROUPS.flatMap((g) => g.items.map(([flag, label]) => [flag, label])));
@@ -60,8 +66,8 @@ const permissionList = (bits) => [...PERMISSION_NAMES].filter(([flag]) => bits &
 
 // Cor e ícone de cada entrada: criar (verde), atualizar (amarelo), excluir (vermelho).
 function tone(action) {
-  if ([A.CHANNEL_CREATE, A.CHANNEL_OVERWRITE_CREATE, A.ROLE_CREATE, A.INVITE_CREATE, A.MEMBER_BAN_REMOVE, A.MESSAGE_PIN].includes(action)) return 'create';
-  if ([A.CHANNEL_DELETE, A.CHANNEL_OVERWRITE_DELETE, A.ROLE_DELETE, A.INVITE_DELETE, A.MEMBER_KICK, A.MEMBER_BAN_ADD, A.MESSAGE_DELETE, A.MESSAGE_UNPIN].includes(action)) return 'delete';
+  if ([A.CHANNEL_CREATE, A.CHANNEL_OVERWRITE_CREATE, A.ROLE_CREATE, A.INVITE_CREATE, A.MEMBER_BAN_REMOVE, A.MESSAGE_PIN, A.THREAD_CREATE].includes(action)) return 'create';
+  if ([A.CHANNEL_DELETE, A.CHANNEL_OVERWRITE_DELETE, A.ROLE_DELETE, A.INVITE_DELETE, A.MEMBER_KICK, A.MEMBER_BAN_ADD, A.MESSAGE_DELETE, A.MESSAGE_UNPIN, A.THREAD_DELETE].includes(action)) return 'delete';
   return 'update';
 }
 function ActionIcon({ action }) {
@@ -72,6 +78,7 @@ function ActionIcon({ action }) {
     : action === A.MEMBER_UPDATE || action === A.MEMBER_ROLE_UPDATE ? UserCog
     : action >= 30 && action < 40 ? Shield
     : action >= 40 && action < 50 ? Link
+    : action >= 110 && action < 120 ? MessagesSquare
     : action === A.MESSAGE_DELETE ? Trash2 : Pin;
   return <span className={`audit-icon ${tone(action)}`}><Icon size={16} /></span>;
 }
@@ -123,6 +130,7 @@ export default function AuditLog({ guild }) {
   const overwriteTarget = (entry) => (entry.options?.type === '1'
     ? who(entry.options.id)
     : <b>{entry.options?.id === guild.id ? '@everyone' : guild.roles[entry.options?.id]?.name ?? entry.options?.role_name ?? 'cargo excluído'}</b>);
+  const threadName = (entry) => <b>{state.channels[entry.target_id]?.name ?? change(entry, 'name')?.new_value ?? change(entry, 'name')?.old_value ?? 'conversa excluída'}</b>;
   const isCategory = (entry) => (state.channels[entry.target_id]?.type ?? change(entry, 'type')?.old_value ?? change(entry, 'type')?.new_value) === 4;
 
   // Frase principal de cada entrada, no tom do registro de auditoria do Discord.
@@ -150,6 +158,9 @@ export default function AuditLog({ guild }) {
       case A.MESSAGE_DELETE: return <>{actor} excluiu uma mensagem de {who(e.target_id)} em {channelName(e, e.options?.channel_id)}</>;
       case A.MESSAGE_PIN: return <>{actor} fixou uma mensagem de {who(e.target_id)} em {channelName(e, e.options?.channel_id)}</>;
       case A.MESSAGE_UNPIN: return <>{actor} desafixou uma mensagem de {who(e.target_id)} em {channelName(e, e.options?.channel_id)}</>;
+      case A.THREAD_CREATE: return <>{actor} criou a conversa {threadName(e)}</>;
+      case A.THREAD_UPDATE: return <>{actor} atualizou a conversa {threadName(e)}</>;
+      case A.THREAD_DELETE: return <>{actor} excluiu a conversa {threadName(e)}</>;
       default: return <>{actor} fez uma alteração</>;
     }
   };
@@ -169,6 +180,9 @@ export default function AuditLog({ guild }) {
       else if (key === 'banner_hash') lines.push(to ? <>Alterou o banner</> : <>Removeu o banner</>);
       else if (key === 'system_channel_id') lines.push(to ? <>Definiu o canal de mensagens do sistema como {channel(to)}</> : <>Desativou as mensagens do sistema</>);
       else if (key === 'system_channel_flags') lines.push((to ?? 0) & 1 ? <>Desativou a mensagem de boas-vindas</> : <>Ativou a mensagem de boas-vindas</>);
+      else if (key === 'archived') lines.push(to ? <>Arquivou a conversa</> : <>Desarquivou a conversa</>);
+      else if (key === 'locked') lines.push(to ? <>Bloqueou a conversa</> : <>Desbloqueou a conversa</>);
+      else if (key === 'auto_archive_duration') lines.push(<>Arquivar após inatividade: <b>{archiveLabel(to)}</b></>);
       else if (key === 'nick') lines.push(to ? <>Alterou o apelido para <b>{to}</b></> : <>Removeu o apelido <b>{from}</b></>);
       else if (key === '$add') lines.push(<>Adicionou {to.length > 1 ? 'os cargos' : 'o cargo'} <b>{to.map((r) => r.name).join(', ')}</b></>);
       else if (key === '$remove') lines.push(<>Removeu {to.length > 1 ? 'os cargos' : 'o cargo'} <b>{to.map((r) => r.name).join(', ')}</b></>);

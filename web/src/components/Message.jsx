@@ -1,6 +1,6 @@
 import {
-  ArrowLeft, ArrowRight, Copy, CornerUpLeft, Ellipsis, IdCard, Image as ImageIcon, Link, MessageSquareDot, Pencil, Phone, PhoneMissed, Pin,
-  PinOff, Reply, SmilePlus, Trash2,
+  ArrowLeft, ArrowRight, Copy, CornerUpLeft, Ellipsis, IdCard, Image as ImageIcon, Link, MessageSquareDot, MessagesSquare, Pencil, Phone,
+  PhoneMissed, Pin, PinOff, Reply, SmilePlus, Trash2,
 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { openMenu, openPopout, showError } from '../lib/dialogs.js';
@@ -13,6 +13,7 @@ import MessageAttachments from './Attachments.jsx';
 import Avatar from './Avatar.jsx';
 import EmojiPicker from './EmojiPicker.jsx';
 import Markdown, { InlineMarkdown, isJumbo } from './Markdown.jsx';
+import { ThreadPreview } from './Threads.jsx';
 
 // Texto da mensagem com markdown, links (os de mensagem do app pulam até ela) e menções.
 export function Content({ text, ...ctx }) {
@@ -90,6 +91,17 @@ function SystemMessage({ message: m, ctx }) {
     tone = 'join';
     icon = <ArrowRight size={18} />;
     text = WELCOME[new Date(m.timestamp).getTime() % WELCOME.length](actor);
+  } else if (m.type === 18) {
+    // Conversa criada sem mensagem de origem.
+    const thread = ctx.threadOf(m.meta?.thread_id);
+    icon = <MessagesSquare size={18} />;
+    text = (
+      <>
+        {actor} iniciou uma conversa:{' '}
+        {thread ? <button className="link strong" onClick={() => ctx.onOpenThread(thread)}>{thread.name}</button> : <b>{m.content}</b>}.
+        Veja todas as <button className="link strong" onClick={ctx.onOpenThreads}>conversas</button>.
+      </>
+    );
   } else if (m.type === 6) {
     icon = <Pin size={18} />;
     text = (
@@ -106,6 +118,28 @@ function SystemMessage({ message: m, ctx }) {
     <div className={`message system-message ${tone}`} id={`msg-${m.id}`}>
       <span className="system-icon">{icon}</span>
       <div className="system-text">{text} <Time iso={m.timestamp} /></div>
+    </div>
+  );
+}
+
+// Primeira mensagem de uma conversa (tipo 21): mostra a mensagem de origem.
+function StarterMessage({ message, ctx }) {
+  const ref = message.referenced_message;
+  if (!ref) return <div className="message system-message starter-missing" id={`msg-${message.id}`}><span className="system-icon"><MessagesSquare size={18} /></span><div className="system-text">A mensagem original foi excluída.</div></div>;
+  const author = ctx.users[ref.author.id] ?? ref.author;
+  return (
+    <div className="message starter-message" id={`msg-${message.id}`}>
+      <div className="message-row">
+        <button className="message-avatar" onClick={(e) => ctx.onPopout(ref.author.id, e)}><Avatar user={author} size={40} /></button>
+        <div className="message-body">
+          <div className="message-meta">
+            <button className="author" style={{ color: ctx.colorOf(ref.author.id) }} onClick={(e) => ctx.onPopout(ref.author.id, e)}>{ctx.nameOf(ref.author.id, author)}</button>
+            <Time iso={ref.timestamp} />
+          </div>
+          {ref.content && <div className={`content${isJumbo(ref.content) ? ' jumbo' : ''}`}><Markdown text={ref.content} {...markdownProps(ctx)} /></div>}
+          <MessageAttachments message={ref} />
+        </div>
+      </div>
     </div>
   );
 }
@@ -233,6 +267,7 @@ export function messageMenuItems(message, ctx, anchorRect) {
       ? { label: 'Desafixar mensagem', icon: PinOff, onClick: () => unpinMessage(message) }
       : { label: 'Fixar mensagem', icon: Pin, onClick: () => pinMessage(message) }),
     ctx.canSend && { label: 'Responder', icon: Reply, onClick: () => ctx.onReply(message) },
+    ctx.canCreateThread && !ctx.threadOf(message.id) && { label: 'Criar conversa', icon: MessagesSquare, onClick: () => ctx.onCreateThread(message) },
     { separator: true },
     { label: 'Copiar texto', icon: Copy, onClick: () => copyText(message.content) },
     { label: 'Marcar como não lida', icon: MessageSquareDot, onClick: () => markUnread(message, ctx.list) },
@@ -244,7 +279,9 @@ export function messageMenuItems(message, ctx, anchorRect) {
 }
 
 export default function Message({ message: m, grouped, ctx }) {
+  if (m.type === 21) return <StarterMessage message={m} ctx={ctx} />;
   if (!isUserMessage(m)) return <SystemMessage message={m} ctx={ctx} />;
+  const thread = ctx.threadOf(m.id);
 
   const author = ctx.users[m.author.id] ?? m.author;
   const own = m.author.id === ctx.me.id;
@@ -316,6 +353,7 @@ export default function Message({ message: m, grouped, ctx }) {
           )}
           <MessageAttachments message={m} />
           <Reactions message={m} ctx={ctx} />
+          {thread && <ThreadPreview thread={thread} onOpen={() => ctx.onOpenThread(thread)} />}
         </div>
       </div>
 
@@ -333,6 +371,9 @@ export default function Message({ message: m, grouped, ctx }) {
           )}
           {own && ctx.canSend && (
             <button aria-label="Responder" title="Responder" onClick={() => ctx.onReply(m)}><CornerUpLeft size={18} /></button>
+          )}
+          {ctx.canCreateThread && !thread && (
+            <button aria-label="Criar conversa" title="Criar conversa" onClick={() => ctx.onCreateThread(m)}><MessagesSquare size={18} /></button>
           )}
           <button aria-label="Mais" title="Mais" onClick={(e) => openMore(e.currentTarget.getBoundingClientRect())}>
             <Ellipsis size={18} />

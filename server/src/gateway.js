@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import {
-  CHANNEL_CATEGORY, CHANNEL_DM, CHANNEL_GROUP_DM, CHANNEL_VOICE, REL, messagePayload, privateUser, publicUser, q, toChannel, toOverwrite,
+  CHANNEL_CATEGORY, CHANNEL_DM, CHANNEL_GROUP_DM, CHANNEL_THREAD, CHANNEL_VOICE, REL, messagePayload, privateUser, publicUser, q, toChannel,
+  toOverwrite, toThread,
 } from './db.js';
 import { P, computeOverwrites, computePermissions, has, highestPosition } from './permissions.js';
 import { snowflake } from './snowflake.js';
@@ -74,8 +75,25 @@ export function statusOf(userId) {
   return pref === 'invisible' ? 'offline' : pref;
 }
 
+// Status personalizado guardado em users.custom_status; vencido conta como nenhum.
+export function customStatusOf(user) {
+  const custom = user?.custom_status ? JSON.parse(user.custom_status) : null;
+  if (!custom || (custom.expires_at && Date.parse(custom.expires_at) <= Date.now())) return null;
+  return custom;
+}
+
+// Presença no formato do Discord: o status personalizado vai como atividade do tipo 4 (e some offline).
+export function presenceOf(userId) {
+  const status = statusOf(userId);
+  const custom = status === 'offline' ? null : customStatusOf(q.userById.get(userId));
+  const activities = custom
+    ? [{ type: 4, name: 'Custom Status', state: custom.text || null, emoji: custom.emoji_name ? { name: custom.emoji_name } : null }]
+    : [];
+  return { user_id: userId, status, activities };
+}
+
 export function broadcastPresence(userId) {
-  dispatchToUsers(relatedUserIds(userId), 'PRESENCE_UPDATE', { user_id: userId, status: statusOf(userId) });
+  dispatchToUsers(relatedUserIds(userId), 'PRESENCE_UPDATE', presenceOf(userId));
 }
 
 // --- permissões (o cliente calcula o mesmo a partir dos cargos para montar a interface) ---
@@ -92,6 +110,9 @@ export function rankOf(guild, userId) {
 
 // Permissões de um membro num canal do servidor (com os overwrites do canal).
 export function channelPermissionsOf(channel, userId) {
+  // Conversas seguem as permissões do canal em que estão.
+  if (channel.type === CHANNEL_THREAD) channel = q.channel.get(channel.parent_id);
+  if (!channel) return 0;
   const guild = q.guild.get(channel.guild_id);
   if (!q.member.get(guild.id, userId)) return 0;
   const roleIds = q.memberRoles.all(guild.id, userId).map((r) => r.role_id);
@@ -117,10 +138,12 @@ function visibility(guildId, userIds) {
     const base = computePermissions(guild, roles, roleIds, userId);
     const visible = new Set();
     const viewOf = (c) => has(computeOverwrites(base, overwrites.get(c.id), guildId, roleIds, userId), P.VIEW_CHANNEL);
-    for (const c of channels) if (c.type !== CHANNEL_CATEGORY && viewOf(c)) visible.add(c.id);
+    for (const c of channels) if (c.type !== CHANNEL_CATEGORY && c.type !== CHANNEL_THREAD && viewOf(c)) visible.add(c.id);
     for (const c of channels) {
       if (c.type === CHANNEL_CATEGORY && (viewOf(c) || channels.some((x) => x.parent_id === c.id && visible.has(x.id)))) visible.add(c.id);
     }
+    // Conversas: visíveis para quem vê o canal delas.
+    for (const c of channels) if (c.type === CHANNEL_THREAD && visible.has(c.parent_id)) visible.add(c.id);
     result.set(userId, visible);
   }
   return { channels, overwrites, result };
@@ -144,6 +167,10 @@ function remember(userId, guildId, ids) {
 
 export const forgetGuild = (userId, guildId) => seenChannels.get(userId)?.delete(guildId);
 
+// Conversas viram THREAD_CREATE/THREAD_UPDATE; o resto, CHANNEL_CREATE/CHANNEL_UPDATE.
+const channelEvent = (c, overwrites, action) =>
+  c.type === CHANNEL_THREAD ? [`THREAD_${action}`, toThread(c)] : [`CHANNEL_${action}`, toChannel(c, overwrites)];
+
 // Recalcula a visibilidade dos canais do servidor para quem está conectado e manda a diferença.
 // `updated`: canais que mudaram (quem continua vendo recebe CHANNEL_UPDATE).
 export function syncChannels(guildId, updated = []) {
@@ -154,8 +181,8 @@ export function syncChannels(guildId, updated = []) {
     const before = seenChannels.get(userId)?.get(guildId) ?? new Set();
     const now = result.get(userId);
     for (const id of now) {
-      if (!before.has(id)) dispatchToUser(userId, 'CHANNEL_CREATE', toChannel(byId.get(id), overwrites.get(id)));
-      else if (updated.includes(id)) dispatchToUser(userId, 'CHANNEL_UPDATE', toChannel(byId.get(id), overwrites.get(id)));
+      if (!before.has(id)) dispatchToUser(userId, ...channelEvent(byId.get(id), overwrites.get(id), 'CREATE'));
+      else if (updated.includes(id)) dispatchToUser(userId, ...channelEvent(byId.get(id), overwrites.get(id), 'UPDATE'));
     }
     for (const id of before) {
       if (now.has(id)) continue;
@@ -209,9 +236,10 @@ export function buildGuild(guild, viewerId) {
   return {
     ...guildFields(guild),
     roles: q.roles.all(guild.id).map(toRole),
-    channels: channels.filter((c) => visible.has(c.id)).map((c) => toChannel(c, overwrites.get(c.id))),
+    channels: channels.filter((c) => visible.has(c.id) && c.type !== CHANNEL_THREAD).map((c) => toChannel(c, overwrites.get(c.id))),
+    threads: channels.filter((c) => visible.has(c.id) && c.type === CHANNEL_THREAD).map(toThread),
     members,
-    presences: members.map((m) => ({ user_id: m.user.id, status: statusOf(m.user.id) })),
+    presences: members.map((m) => presenceOf(m.user.id)),
     voice_states: [...voiceStates.values()].filter((v) => v.guild_id === guild.id).map(publicVoice),
   };
 }
@@ -437,11 +465,12 @@ function handleIdentify(ws, d) {
     v: 1,
     session_id: randomUUID(),
     user: privateUser(user),
-    user_settings: { guild_positions: JSON.parse(user.guild_positions ?? '[]') },
+    user_settings: { guild_positions: JSON.parse(user.guild_positions ?? '[]'), custom_status: customStatusOf(user) },
+    notes: Object.fromEntries(q.notesOf.all(user.id).map((n) => [n.target_id, n.note])),
     guilds: q.guildsOf.all(user.id).map((g) => buildGuild(g, user.id)),
     relationships,
     private_channels: privateChannels,
-    presences: [...presenceIds].map((id) => ({ user_id: id, status: statusOf(id) })),
+    presences: [...presenceIds].map(presenceOf),
     calls: activeCalls,
   }, 'READY');
 

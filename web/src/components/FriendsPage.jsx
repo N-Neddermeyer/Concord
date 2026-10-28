@@ -5,7 +5,9 @@ import { confirmDialog, openMenu, openPopout, showError } from '../lib/dialogs.j
 import { REL, useStore } from '../lib/store.js';
 import { STATUS_LABELS, displayName } from '../lib/util.js';
 import Avatar from './Avatar.jsx';
+import { CustomStatus } from './CustomStatus.jsx';
 import { openDm } from './UserPopout.jsx';
+import { openProfile } from './UserProfile.jsx';
 
 const TABS = [
   ['online', 'Online'],
@@ -85,6 +87,7 @@ function FriendList({ tab }) {
   const relationships = useStore((s) => s.relationships);
   const users = useStore((s) => s.users);
   const presences = useStore((s) => s.presences);
+  const activities = useStore((s) => s.activities);
   const [query, setQuery] = useState('');
 
   const wanted = {
@@ -132,7 +135,8 @@ function FriendList({ tab }) {
     if (row.type === REL.INCOMING) return 'Pedido de amizade recebido';
     if (row.type === REL.OUTGOING) return 'Pedido de amizade enviado';
     if (row.type === REL.BLOCKED) return 'Bloqueado';
-    return STATUS_LABELS[presences[row.id] ?? 'offline'];
+    const status = presences[row.id] ?? 'offline';
+    return status !== 'offline' && activities[row.id] ? <CustomStatus status={activities[row.id]} /> : STATUS_LABELS[status];
   };
 
   return (
@@ -178,6 +182,8 @@ function FriendList({ tab }) {
                         rect: e.currentTarget.getBoundingClientRect(),
                         side: 'below',
                         items: [
+                          { label: 'Ver perfil', onClick: () => openProfile(row.id) },
+                          { separator: true },
                           { label: 'Remover amizade', danger: true, onClick: () => removeFriend(row.user) },
                           { label: 'Bloquear', danger: true, onClick: () => block(row.user) },
                         ],

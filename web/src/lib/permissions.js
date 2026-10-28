@@ -59,11 +59,17 @@ export function applyOverwrites(base, overwrites, guildId, roleIds, userId) {
 }
 
 export function channelPermissionsFor(state, channelId, userId = state.user?.id) {
-  const channel = state.channels[channelId];
-  if (!channel?.guild_id) return ALL_PERMISSIONS;
+  let channel = state.channels[channelId];
+  // Conversas seguem as permissões do canal em que estão.
+  if (channel?.type === 11) channel = state.channels[channel.parent_id];
+  if (!channel) return 0;
+  if (!channel.guild_id) return ALL_PERMISSIONS;
   const roleIds = state.members[channel.guild_id]?.[userId]?.roles ?? [];
   return applyOverwrites(permissionsFor(state, channel.guild_id, userId), channel.permission_overwrites ?? [], channel.guild_id, roleIds, userId);
 }
+
+// Conversas: o clone não tem os bits de 64 bits do Discord; gerenciar segue Gerenciar mensagens/canais.
+export const canManageThreads = (perms) => has(perms, P.MANAGE_MESSAGES) || has(perms, P.MANAGE_CHANNELS);
 
 // "Canal privado": o @everyone não vê (como o cadeado do Discord na barra lateral).
 export const isPrivateChannel = (channel) =>

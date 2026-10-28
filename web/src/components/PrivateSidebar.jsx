@@ -4,6 +4,7 @@ import { confirmDialog, openModal, showError } from '../lib/dialogs.js';
 import { HOME, REL, dispatch, dmRecipient, isPrivate, navigate, privateChannelName, useStore } from '../lib/store.js';
 import { compareIds, displayName } from '../lib/util.js';
 import Avatar, { GroupIcon } from './Avatar.jsx';
+import { CustomStatus } from './CustomStatus.jsx';
 import { NewDmModal, QuickSwitcher } from './modals.jsx';
 import { openDm, openGroup } from './UserPopout.jsx';
 
@@ -14,6 +15,7 @@ export default function PrivateSidebar({ activeChannelId }) {
   const mentions = useStore((s) => s.mentions);
   const relationships = useStore((s) => s.relationships);
   const calls = useStore((s) => s.calls);
+  const activities = useStore((s) => s.activities);
   const state = useStore((s) => s);
 
   const pending = Object.values(relationships).filter((r) => r.type === REL.INCOMING).length;
@@ -48,7 +50,10 @@ export default function PrivateSidebar({ activeChannelId }) {
             <div key={c.id} className={`dm-item${c.id === activeChannelId ? ' active' : ''}${mentions[c.id] ? ' unread' : ''}`}>
               <button className="dm-main" onClick={() => navigate(HOME, c.id)}>
                 <Avatar user={user} size={32} status={status} />
-                <span className="dm-name">{displayName(user)}</span>
+                <span className="dm-text">
+                  <span className="dm-name">{displayName(user)}</span>
+                  {status !== 'offline' && activities[user.id] && <span className="dm-sub"><CustomStatus status={activities[user.id]} /></span>}
+                </span>
                 {calls[c.id] && <Phone size={14} className="dm-call" aria-label="Chamada em andamento" />}
               </button>
               {mentions[c.id] > 0 && <span className="badge inline">{mentions[c.id]}</span>}
