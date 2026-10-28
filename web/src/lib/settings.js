@@ -18,6 +18,8 @@ const DEFAULTS = {
   autoGainControl: true,
   desktopNotifications: true,
   sounds: true,
+  streamAudio: true, // compartilhar o som junto com a tela
+  userAudio: {}, // volume e silenciar por pessoa: userId -> { volume, muted, streamVolume, streamMuted }
   callHeaderHeight: null, // altura da chamada na DM, ajustada arrastando a borda (null = padrão)
 };
 

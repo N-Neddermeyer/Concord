@@ -125,13 +125,20 @@ não libera esses dispositivos (exige HTTPS); use o app desktop.
   no nome da DM e em "Perfil" no clique direito do membro). O perfil completo tem Sobre mim, membro
   desde (no app e no servidor), nota pessoal (só você vê, até 256 caracteres) e as abas de servidores
   e amigos em comum.
-- **Voz**: mudo, ensurdecer, detecção de voz com anel verde, sons de entrar/sair.
+- **Voz**: mudo, ensurdecer, detecção de voz com anel verde, sons de entrar/sair. Volume de saída até
+  200%. Clique direito em quem está na chamada (lista do canal, membros ou bloco da chamada): "Volume do
+  usuário" de 0 a 200% e "Silenciar" só para você (ícone vermelho ao lado do nome e sem anel de fala);
+  se a pessoa está transmitindo, também "Volume da transmissão" e "Silenciar transmissão" (ou o botão de
+  som no canto do bloco da tela). Fica salvo neste dispositivo, como no Discord.
 - **Vídeo e tela**: câmera e compartilhamento de tela na chamada de DM/grupo e no canal de voz do
   servidor (que abre na área principal com a grade de participantes). Botão de chamada de vídeo no
   cabeçalho da DM, Câmera/Tela no painel "Voz conectada", clique no bloco para ampliar, duplo clique
   para tela cheia, selo "Ao vivo" e ícone de câmera na lista do canal. No desktop, o seletor de
   "Compartilhar tela" (Aplicativos/Telas, 15/30/60 FPS); no navegador, o seletor do próprio navegador.
-  A tela vai sem áudio. Em Voz e vídeo: escolha da câmera e "Testar vídeo".
+  No desktop (Windows), "Compartilhar áudio" no seletor leva o som do sistema junto com a tela, em
+  estéreo e sem o processamento de voz; o som do próprio app (as vozes da chamada) fica de fora, então
+  ninguém ouve eco. No navegador, a opção de áudio é a do seletor do navegador. Em Voz e vídeo: escolha
+  da câmera e "Testar vídeo".
 - **Layouts da chamada** (mesmo modelo do Discord): na DM, arrastar a borda de baixo da chamada ajusta
   a altura (de 230 px até a altura do canal menos 200; fica salva). Com vídeo, "Ocultar chat" faz a
   chamada ocupar o canal e "Tela cheia" põe o app inteiro em tela cheia (Esc volta ao layout anterior).
@@ -176,6 +183,8 @@ Só imagem, vídeo e áudio abrem no navegador; os demais tipos são sempre serv
 - Voz P2P em malha: boa para poucas pessoas na mesma rede. Para mais gente, troque por um SFU (LiveKit, mediasoup).
 - Sem STUN/TURN: funciona em `localhost` e na rede local, não pela internet.
 - Sem emojis personalizados. Blocos de código sem cores de sintaxe.
+- Som da tela: no desktop só no Windows, e é o som do sistema inteiro (menos o do app), mesmo ao
+  compartilhar uma única janela — o Discord captura só o som daquele aplicativo.
 - Conversas: só as públicas (sem conversas privadas nem canais de fórum). O clone não tem os bits de
   permissão de 64 bits do Discord, então criar e falar em conversas segue "Enviar mensagens", e
   gerenciá-las (bloquear, excluir, editar as dos outros) segue "Gerenciar mensagens" ou "Gerenciar canais".

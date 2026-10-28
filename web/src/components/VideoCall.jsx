@@ -1,17 +1,20 @@
 import {
   HeadphoneOff, Headphones, Maximize, MessageSquare, MessageSquareOff, Mic, MicOff, Minimize, Monitor, MonitorUp, PhoneOff, Video,
-  VideoOff,
+  VideoOff, Volume2, VolumeX,
 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import {
   LAYOUT, fullscreenParticipant, selectParticipant, toggleChat, toggleFullScreen, useCallLayout,
 } from '../lib/callLayout.js';
-import { openModal } from '../lib/dialogs.js';
+import { openMenu, openModal, pointRect } from '../lib/dialogs.js';
 import { native } from '../lib/native.js';
-import { memberName, useStore } from '../lib/store.js';
-import { useVoice, voice } from '../lib/voice.js';
+import { getSettings, updateSettings, useSettings } from '../lib/settings.js';
+import { getState, memberName, useStore } from '../lib/store.js';
+import { setUserAudio, userAudio, useVoice, voice } from '../lib/voice.js';
 import Avatar from './Avatar.jsx';
 import { Modal } from './Modal.jsx';
+import { Toggle } from './settings/SettingsLayout.jsx';
+import { inMyCall, openVoiceUserMenu, useLocallyMuted, voiceMenuItems } from './UserVolume.jsx';
 
 // Peças de vídeo compartilhadas pela chamada da DM/grupo e pelo canal de voz do servidor:
 // os blocos (câmera, avatar ou tela), os controles e o seletor de "Compartilhar tela".
@@ -54,6 +57,19 @@ export function VideoTile({ tile, focused = false, fullscreen = false, onFocus, 
   const isScreen = kind === 'screen';
   const showVideo = !!track;
   const label = fullscreen && focused ? 'Sair da tela cheia' : 'Tela cheia';
+  const localMute = useLocallyMuted(user.id);
+  useSettings(); // botão de som da transmissão
+  const remoteStream = isScreen && user.id !== me && !!state && inMyCall(getState(), user.id);
+  const streamMuted = remoteStream && userAudio(user.id).streamMuted;
+
+  const onMenu = (e) => {
+    if (!state) return;
+    if (!isScreen) return openVoiceUserMenu(e, getState(), user.id, state.guild_id);
+    e.preventDefault();
+    const items = voiceMenuItems(getState(), user.id, { only: 'stream' });
+    if (!items.length) return;
+    openMenu({ rect: pointRect(e), side: 'right', items });
+  };
 
   return (
     <div
@@ -61,6 +77,7 @@ export function VideoTile({ tile, focused = false, fullscreen = false, onFocus, 
       style={showVideo ? undefined : { background: user.banner_color ?? '#2b2d31' }}
       onClick={onFocus}
       onDoubleClick={onFullscreen}
+      onContextMenu={onMenu}
     >
       {showVideo ? (
         <VideoTrack track={track} mirror={!isScreen && user.id === me} contain={isScreen || focused} />
@@ -79,8 +96,20 @@ export function VideoTile({ tile, focused = false, fullscreen = false, onFocus, 
       <div className="video-tile-label">
         {isScreen && <span className="live-pill">Ao vivo</span>}
         {!isScreen && state?.self_deaf ? <HeadphoneOff size={14} /> : !isScreen && state?.self_mute ? <MicOff size={14} /> : null}
+        {!isScreen && localMute && user.id !== me && <span className="local-mute" title="Silenciado por você"><MicOff size={14} /></span>}
         <span>{name}</span>
       </div>
+      {remoteStream && (
+        <button
+          className={`video-tile-volume${streamMuted ? ' muted' : ''}`}
+          aria-label={streamMuted ? 'Ativar som da transmissão' : 'Silenciar transmissão'}
+          title={streamMuted ? 'Ativar som da transmissão' : 'Silenciar transmissão'}
+          onClick={(e) => { e.stopPropagation(); setUserAudio(user.id, { streamMuted: !streamMuted }); }}
+          onDoubleClick={(e) => e.stopPropagation()}
+        >
+          {streamMuted ? <VolumeX size={16} /> : <Volume2 size={16} />}
+        </button>
+      )}
       <button
         className="video-tile-fullscreen"
         aria-label={label}
@@ -181,7 +210,7 @@ export function FullscreenButton({ channelId }) {
 export function toggleScreenShare() {
   if (voice.screen) return voice.stopScreen();
   if (native?.screen) return openModal(ScreenShareModal);
-  voice.startScreen(); // navegador: o seletor é o do próprio navegador
+  voice.startScreen({ audio: true }); // navegador: o seletor (e a opção de áudio) é o do próprio navegador
 }
 
 const FRAME_RATES = [15, 30, 60];
@@ -191,16 +220,22 @@ function ScreenShareModal({ close }) {
   const [tab, setTab] = useState('window');
   const [selected, setSelected] = useState(null);
   const [frameRate, setFrameRate] = useState(30);
+  const [audio, setAudio] = useState(() => getSettings().streamAudio);
+  const audioAvailable = native.platform === 'win32'; // o loopback do sistema só existe no Windows
 
   useEffect(() => {
     native.screen.getSources().then(setSources).catch(() => setSources([]));
   }, []);
 
   const list = (sources ?? []).filter((s) => s.kind === tab);
-  const go = () => {
-    native.screen.select(selected);
+  const go = (id = selected) => {
+    native.screen.select(id);
     close();
-    voice.startScreen({ frameRate });
+    voice.startScreen({ frameRate, audio: audioAvailable && audio });
+  };
+  const toggleAudio = () => {
+    setAudio(!audio);
+    updateSettings({ streamAudio: !audio });
   };
 
   return (
@@ -218,8 +253,14 @@ function ScreenShareModal({ close }) {
               ))}
             </div>
           </div>
+          {audioAvailable && (
+            <label className="screen-share-audio">
+              <Toggle checked={audio} onChange={toggleAudio} />
+              <span>Compartilhar áudio</span>
+            </label>
+          )}
           <button className="button link-button" onClick={close}>Cancelar</button>
-          <button className="button brand" disabled={!selected} onClick={go}>Ao vivo</button>
+          <button className="button brand" disabled={!selected} onClick={() => go()}>Ao vivo</button>
         </>
       }
     >
@@ -240,9 +281,7 @@ function ScreenShareModal({ close }) {
               onClick={() => setSelected(s.id)}
               onDoubleClick={() => {
                 setSelected(s.id);
-                native.screen.select(s.id);
-                close();
-                voice.startScreen({ frameRate });
+                go(s.id);
               }}
             >
               <img src={s.thumbnail} alt="" draggable={false} />

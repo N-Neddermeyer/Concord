@@ -387,8 +387,10 @@ function configurePermissions() {
     if (!fromApp(request.securityOrigin ?? request.frame?.url) || !id) return callback({});
     const sources = await desktopCapturer.getSources({ types: ['window', 'screen'], thumbnailSize: { width: 0, height: 0 } });
     const source = sources.find((s) => s.id === id);
-    // Sem áudio: o loopback do sistema incluiria as vozes da própria chamada (eco para os outros).
-    callback(source ? { video: source } : {});
+    // Som da tela: o loopback do sistema (só no Windows). A página pede com restrictOwnAudio, e o
+    // Chromium troca para o loopback sem o som do próprio app, sem eco das vozes da chamada.
+    const audio = request.audioRequested && process.platform === 'win32' ? { audio: 'loopback' } : {};
+    callback(source ? { video: source, ...audio } : {});
   });
 }
 

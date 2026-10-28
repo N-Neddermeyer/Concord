@@ -9,6 +9,7 @@ import { CustomStatus } from './CustomStatus.jsx';
 import { BanModal, NicknameModal } from './modals.jsx';
 import { openDm } from './UserPopout.jsx';
 import { openProfile } from './UserProfile.jsx';
+import { voiceMenuItems } from './UserVolume.jsx';
 
 // Clique direito num membro: perfil, mensagem, apelido e moderação, conforme as permissões.
 export function openMemberMenu(e, state, guildId, userId) {
@@ -38,6 +39,7 @@ export function openMemberMenu(e, state, guildId, userId) {
     items: [
       { label: 'Perfil', onClick: () => openProfile(userId, guildId) },
       !isMe && { label: 'Mensagem', icon: MessageCircle, onClick: () => openDm(userId) },
+      ...voiceMenuItems(state, userId),
       canNick && { separator: true },
       canNick && { label: isMe ? 'Editar perfil do servidor' : 'Alterar apelido', icon: Pencil, onClick: () => openModal(NicknameModal, { guildId, userId }) },
       outranks && (has(perms, P.KICK_MEMBERS) || has(perms, P.BAN_MEMBERS)) && { separator: true },

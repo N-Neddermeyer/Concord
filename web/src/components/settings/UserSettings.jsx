@@ -286,7 +286,6 @@ function VoiceSettings() {
     if (!t) return;
     clearInterval(t.timer);
     t.stream.getTracks().forEach((track) => track.stop());
-    t.audio.srcObject = null;
     t.context.close();
     test.current = null;
     setTesting(false);
@@ -299,15 +298,16 @@ function VoiceSettings() {
       const context = new AudioContext();
       const analyser = context.createAnalyser();
       analyser.fftSize = 512;
-      context.createMediaStreamSource(stream).connect(analyser);
+      const source = context.createMediaStreamSource(stream);
+      source.connect(analyser);
+      // Toca de volta pelo Web Audio, como as vozes da chamada (o volume de saída vai até 200%).
+      const gain = context.createGain();
+      gain.gain.value = settings.outputVolume / 100;
+      source.connect(gain).connect(context.destination);
+      if (settings.outputDevice !== 'default') context.setSinkId?.(settings.outputDevice).catch(() => {});
       const buffer = new Uint8Array(analyser.fftSize);
-      const audio = new Audio();
-      audio.srcObject = stream;
-      if (settings.outputDevice !== 'default') audio.setSinkId?.(settings.outputDevice).catch(() => {});
-      audio.volume = Math.min(settings.outputVolume, 100) / 100;
-      audio.play().catch(() => {});
       const timer = setInterval(() => setLevel(levelOf(analyser, buffer)), 50);
-      test.current = { stream, context, audio, timer };
+      test.current = { stream, context, gain, timer };
       setTesting(true);
     } catch (e) {
       showError(`Não foi possível acessar o microfone: ${e.message}`);
@@ -350,7 +350,11 @@ function VoiceSettings() {
         <label className="field">
           <span className="field-label">Volume de saída</span>
           <div className="slider-row">
-            <input type="range" min={0} max={100} value={settings.outputVolume} onChange={(e) => updateSettings({ outputVolume: Number(e.target.value) })} />
+            <input type="range" min={0} max={200} value={settings.outputVolume} onChange={(e) => {
+              const outputVolume = Number(e.target.value);
+              updateSettings({ outputVolume });
+              if (test.current) test.current.gain.gain.value = outputVolume / 100;
+            }} />
             <span>{settings.outputVolume}%</span>
           </div>
         </label>

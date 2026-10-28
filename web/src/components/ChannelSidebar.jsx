@@ -9,8 +9,10 @@ import { closeMenu, confirmDialog, openMenu, openModal, openPopout, pointRect, s
 import { copyText } from '../lib/messages.js';
 import { P, channelPermissionsFor, has, isPrivateChannel, isSynced, permissionsFor } from '../lib/permissions.js';
 import { dispatch, isUnread, memberName, navigate, openLayer, useStore } from '../lib/store.js';
-import { voice } from '../lib/voice.js';
+import { useSettings } from '../lib/settings.js';
+import { userAudio, voice } from '../lib/voice.js';
 import Avatar from './Avatar.jsx';
+import { openMemberMenu } from './MemberList.jsx';
 import { CreateCategoryModal, CreateChannelModal, InviteModal, NicknameModal } from './modals.jsx';
 import { SidebarThreads, threadMenuItems } from './Threads.jsx';
 
@@ -52,6 +54,7 @@ export default function ChannelSidebar({ guildId, activeChannelId }) {
   const voiceStates = useStore((s) => s.voiceStates);
   const users = useStore((s) => s.users);
   const speaking = useStore((s) => s.speaking);
+  useSettings(); // ícone de "silenciado por você"
   const mentions = useStore((s) => s.mentions);
   const collapsed = useStore((s) => s.collapsed);
   const me = useStore((s) => s.user);
@@ -279,12 +282,16 @@ export default function ChannelSidebar({ guildId, activeChannelId }) {
             key={v.user_id}
             className="voice-user"
             onClick={(e) => openPopout({ userId: v.user_id, guildId, rect: e.currentTarget.getBoundingClientRect() })}
+            onContextMenu={(e) => openMemberMenu(e, state, guildId, v.user_id)}
           >
             <Avatar user={users[v.user_id]} size={24} speaking={!!speaking[v.user_id]} />
             <span className={speaking[v.user_id] ? 'speaking-name' : ''}>{memberName(state, guildId, v.user_id)}</span>
             <span className="voice-flags">
               {v.self_stream && <span className="live-pill small">Ao vivo</span>}
               {v.self_video && <Video size={14} />}
+              {v.user_id !== me.id && userAudio(v.user_id).muted && (
+                <span className="local-mute" title="Silenciado por você"><MicOff size={14} /></span>
+              )}
               {v.self_mute && !v.self_deaf && <MicOff size={14} />}
               {v.self_deaf && <HeadphoneOff size={14} />}
             </span>
