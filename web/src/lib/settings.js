@@ -11,6 +11,9 @@ const DEFAULTS = {
   videoDevice: 'default',
   outputDevice: 'default',
   outputVolume: 100,
+  inputMode: 'voice', // voice (detecção de voz) | ptt (pressione para falar)
+  pttKey: null, // { code, name, vk } — tecla ou botão do mouse do pressione para falar
+  pttDelay: 20, // ms de atraso ao soltar a tecla
   autoSensitivity: true,
   sensitivity: -50, // dB, quando a detecção automática está desligada
   echoCancellation: true,

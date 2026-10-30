@@ -2,7 +2,7 @@
 // (a barra de título é desenhada pela página), splash enquanto o backend sobe, ícone na
 // bandeja ao fechar e uma ponte mínima (preload) para os controles da janela.
 const { app, BrowserWindow, Menu, Tray, desktopCapturer, ipcMain, nativeImage, session, shell } = require('electron');
-const { fork } = require('node:child_process');
+const { fork, spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -23,6 +23,7 @@ let tray = null;
 let serverProcess = null;
 let quitting = false;
 let pendingScreenSource = null; // fonte escolhida no seletor da página para o próximo getDisplayMedia
+let pttWatcher = null; // { vk, process } — leitura da tecla do pressione para falar fora de foco
 
 function savedServerUrl() {
   try {
@@ -312,6 +313,44 @@ function createTray() {
   tray.on('click', showMain);
 }
 
+// --- pressione para falar fora de foco ---
+
+// O Discord usa um hook nativo de teclado. Aqui, no Windows, um PowerShell consulta só a tecla
+// escolhida (GetAsyncKeyState) a cada 15 ms e avisa quando ela muda; a página junta isso às teclas
+// que ela mesma recebe em foco. O processo fecha sozinho se o app fechar.
+function watchPttKey(vk) {
+  const key = Number.isInteger(vk) && vk > 0 && vk < 256 ? vk : null;
+  if (key === (pttWatcher?.vk ?? null)) return;
+  pttWatcher?.process.kill();
+  pttWatcher = null;
+  if (!key || process.platform !== 'win32') return;
+
+  const script = `$ErrorActionPreference = 'Stop'
+Add-Type -Namespace CloneLocal -Name Keys -MemberDefinition '[DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);'
+$parent = [System.Diagnostics.Process]::GetProcessById(${process.pid})
+$last = $false
+while (-not $parent.HasExited) {
+  $down = ([CloneLocal.Keys]::GetAsyncKeyState(${key}) -band 0x8000) -ne 0
+  if ($down -ne $last) { [Console]::Out.WriteLine([int]$down); $last = $down }
+  Start-Sleep -Milliseconds 15
+}`;
+  const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script], {
+    windowsHide: true,
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  const watcher = { vk: key, process: child };
+  pttWatcher = watcher;
+  child.stdout.on('data', (chunk) => {
+    const states = String(chunk).match(/[01]/g);
+    if (states && pttWatcher === watcher) mainWindow?.webContents.send('CLONE_PTT_STATE', states.at(-1) === '1');
+  });
+  child.on('exit', () => {
+    if (pttWatcher !== watcher) return;
+    pttWatcher = null;
+    mainWindow?.webContents.send('CLONE_PTT_STATE', false);
+  });
+}
+
 // --- ponte com a página (canais no estilo DISCORD_*, aqui CLONE_*) ---
 
 function fromMainWindow(event) {
@@ -353,6 +392,7 @@ function registerIpc() {
       }));
   });
   on('CLONE_SCREEN_SELECT', (id) => (pendingScreenSource = typeof id === 'string' ? id : null));
+  on('CLONE_PTT_SET_KEY', (vk) => watchPttKey(vk));
 
   // Tela de conexão (splash): trocar o servidor ou sair.
   const fromSplash = (event) => splashWindow && event.sender === splashWindow.webContents;
@@ -413,6 +453,7 @@ app.on('before-quit', () => {
   quitting = true;
   saveWindowState();
   serverProcess?.kill();
+  pttWatcher?.process.kill();
 });
 
 app.on('window-all-closed', () => {

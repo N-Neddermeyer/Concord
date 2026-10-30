@@ -321,6 +321,7 @@ export const MSG = {
 };
 export const MESSAGE_CALL = MSG.CALL;
 
+export const DATA_DIR = dataDir;
 export const ATTACHMENTS_DIR = path.join(dataDir, 'attachments');
 
 const AUTHOR_COLUMNS = 'u.username, u.global_name, u.avatar, u.color, u.banner_color, u.bio';

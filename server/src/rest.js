@@ -34,6 +34,7 @@ import {
   syncChannels,
   toRole,
 } from './gateway.js';
+import { iceServersFor } from './ice.js';
 import {
   ALL_PERMISSIONS, CHANNEL_PERMISSIONS, DEFAULT_PERMISSIONS, OVERWRITE_MEMBER, OVERWRITE_ROLE, P, has,
 } from './permissions.js';
@@ -104,6 +105,9 @@ api.use((req, _res, next) => {
   req.user = user;
   next();
 });
+
+// Servidores STUN/TURN para as chamadas (configurados no servidor; veja ice.js).
+api.get('/voice/ice-servers', (req, res) => res.json(iceServersFor(req.user.id)));
 
 // Servidor do qual o usuário é membro, opcionalmente exigindo uma permissão.
 function loadGuild(req, permission) {

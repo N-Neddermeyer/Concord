@@ -38,10 +38,40 @@ novo (ex.: `192.168.0.10`, a porta 3001 é assumida) e ele reinicia já conectad
 volta ao endereço gravado no instalador. Alternativa sem instalador (com o projeto e `npm install`):
 `$env:CLONE_URL="http://IP:3001"; npm run desktop`.
 
-Voz, câmera e tela vão direto entre as máquinas (sem STUN/TURN): as duas precisam estar na mesma
-rede. O app usa os IPs reais nos candidatos (desliga o mascaramento mDNS do Chromium) e trata a
-origem `http://IP:3001` como segura para liberar microfone, câmera e tela. No navegador, `http://IP:3001`
-não libera esses dispositivos (exige HTTPS); use o app desktop.
+Voz, câmera e tela vão direto entre as máquinas. Sem STUN/TURN configurado (o padrão), as duas
+precisam estar na mesma rede. O app usa os IPs reais nos candidatos (desliga o mascaramento mDNS do
+Chromium) e trata a origem `http://IP:3001` como segura para liberar microfone, câmera e tela. No
+navegador, `http://IP:3001` não libera esses dispositivos (exige HTTPS); use o app desktop.
+
+### Chamadas pela internet (STUN/TURN)
+
+Para chamadas entre redes diferentes, o servidor entrega aos apps uma lista de servidores STUN/TURN
+(rota `/api/voice/ice-servers`). Nada é usado sem configurar: nenhum servidor público é contatado por
+padrão. Configure com variáveis de ambiente ao subir o servidor ou com o arquivo `ice.json` na pasta
+de dados (`server/data/`, ou `DATA_DIR`), que é relido a cada chamada, sem reiniciar:
+
+```json
+{
+  "stun": ["stun:turn.exemplo.com:3478"],
+  "turn": ["turn:turn.exemplo.com:3478?transport=udp", "turn:turn.exemplo.com:3478?transport=tcp"],
+  "secret": "o-mesmo-static-auth-secret-do-coturn"
+}
+```
+
+| Variável / chave do `ice.json` | O que é |
+| --- | --- |
+| `STUN_URLS` / `stun` | Servidores STUN (`stun:host:porta`), separados por vírgula. Ajudam a atravessar o roteador. |
+| `TURN_URLS` / `turn` | Servidores TURN (`turn:` ou `turns:`). Retransmitem a mídia quando a conexão direta falha. |
+| `TURN_USERNAME` + `TURN_CREDENTIAL` / `username` + `credential` | Usuário e senha fixos do TURN. |
+| `TURN_SECRET` / `secret` | Em vez da senha fixa: segredo do coturn (`use-auth-secret`). Cada usuário recebe uma senha temporária. |
+| `TURN_TTL` / `ttl` | Validade da senha temporária em segundos (padrão 86400). O app renova na metade. |
+| `ICE_TRANSPORT_POLICY` / `policy` | `relay` força tudo pelo TURN (para testar ou esconder os IPs). |
+
+As variáveis de ambiente têm prioridade sobre o arquivo. Um TURN próprio comum é o
+[coturn](https://github.com/coturn/coturn) com `use-auth-secret` e `static-auth-secret`. O STUN
+público do Google (`stun:stun.l.google.com:19302`) também funciona, mas revela seu IP público ao Google.
+Clicando em **Voz conectada** (painel de baixo), "Conexão de voz" mostra por pessoa se a conexão é
+direta, por STUN ou retransmitida pelo TURN, e o ping.
 
 ## O que tem
 
@@ -126,7 +156,10 @@ não libera esses dispositivos (exige HTTPS); use o app desktop.
   desde (no app e no servidor), nota pessoal (só você vê, até 256 caracteres) e as abas de servidores
   e amigos em comum.
 - **Voz**: mudo, ensurdecer, detecção de voz com anel verde, sons de entrar/sair. Volume de saída até
-  200%. Clique direito em quem está na chamada (lista do canal, membros ou bloco da chamada): "Volume do
+  200%. **Pressione para falar** em Voz e vídeo → Modo de entrada: atalho gravado (tecla ou botão do meio
+  ou lateral do mouse) e atraso ao soltar (0 a 2 s, padrão 20 ms). No desktop (Windows) o atalho funciona
+  com o app fora de foco, como no Discord (lê só a tecla escolhida); no navegador, só com a aba em foco.
+  Conexão caída reconecta sozinha (até 5 tentativas). Clique direito em quem está na chamada (lista do canal, membros ou bloco da chamada): "Volume do
   usuário" de 0 a 200% e "Silenciar" só para você (ícone vermelho ao lado do nome e sem anel de fala);
   se a pessoa está transmitindo, também "Volume da transmissão" e "Silenciar transmissão" (ou o botão de
   som no canto do bloco da tela). Fica salvo neste dispositivo, como no Discord.
@@ -181,7 +214,10 @@ Só imagem, vídeo e áudio abrem no navegador; os demais tipos são sempre serv
 
 - Sem logo própria por enquanto: o botão de início usa um ícone genérico e a bandeja um círculo.
 - Voz P2P em malha: boa para poucas pessoas na mesma rede. Para mais gente, troque por um SFU (LiveKit, mediasoup).
-- Sem STUN/TURN: funciona em `localhost` e na rede local, não pela internet.
+- STUN/TURN: o clone não traz um servidor TURN; para chamadas pela internet configure um (veja acima).
+- Pressione para falar fora de foco: só no Windows, e pode não detectar a tecla quando o app em foco
+  roda como administrador (o mesmo problema do Discord; não testado aqui). Atalho de uma tecla só,
+  sem combinações.
 - Sem emojis personalizados. Blocos de código sem cores de sintaxe.
 - Som da tela: no desktop só no Windows, e é o som do sistema inteiro (menos o do app), mesmo ao
   compartilhar uma única janela — o Discord captura só o som daquele aplicativo.

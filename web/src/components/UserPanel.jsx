@@ -1,12 +1,13 @@
 import { HeadphoneOff, Headphones, Mic, MicOff, MonitorUp, Pencil, PhoneOff, Settings, Signal, Smile, Video, VideoOff, X } from 'lucide-react';
 import { OP, gateway } from '../lib/gateway.js';
-import { openMenu, openModal } from '../lib/dialogs.js';
+import { openMenu, openModal, openPopout } from '../lib/dialogs.js';
 import { HOME, isPrivate, navigate, openLayer, privateChannelName, useStore } from '../lib/store.js';
 import { STATUS_LABELS, displayName } from '../lib/util.js';
 import { useVoice, voice } from '../lib/voice.js';
 import Avatar from './Avatar.jsx';
 import { CustomStatus, CustomStatusModal, saveCustomStatus } from './CustomStatus.jsx';
 import { toggleScreenShare } from './VideoCall.jsx';
+import { VoiceConnectionPopout } from './VoiceConnection.jsx';
 
 const STATUS_OPTIONS = [
   ['online', null],
@@ -27,10 +28,18 @@ export function VoicePanel() {
   return (
     <div className="voice-panel">
       <div className="voice-panel-row">
-        <button className="voice-info" onClick={() => navigate(session.guildId ?? HOME, session.channelId)}>
-          <div className="voice-connected"><Signal size={16} /> Voz conectada</div>
-          <div className="voice-where">{privateName ? (channel.type === 1 ? `@${privateName}` : privateName) : `${channel?.name} / ${guild?.name}`}</div>
-        </button>
+        <div className="voice-info">
+          <button
+            className="voice-connected"
+            title="Conexão de voz"
+            onClick={(e) => openPopout({ Component: VoiceConnectionPopout, props: {}, rect: e.currentTarget.getBoundingClientRect(), side: 'above' })}
+          >
+            <Signal size={16} /> Voz conectada
+          </button>
+          <button className="voice-where" onClick={() => navigate(session.guildId ?? HOME, session.channelId)}>
+            {privateName ? (channel.type === 1 ? `@${privateName}` : privateName) : `${channel?.name} / ${guild?.name}`}
+          </button>
+        </div>
         <button className="panel-button" aria-label="Desconectar" title="Desconectar" onClick={() => voice.leave()}>
           <PhoneOff size={20} />
         </button>

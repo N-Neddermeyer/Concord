@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 import { api } from '../../lib/api.js';
 import { confirmDialog, openModal, showError } from '../../lib/dialogs.js';
 import { pickImage } from '../../lib/image.js';
+import { keyFromEvent } from '../../lib/keys.js';
 import { isDesktop, native } from '../../lib/native.js';
 import { updateSettings, useSettings } from '../../lib/settings.js';
 import { closeLayer, openLayer, useStore } from '../../lib/store.js';
@@ -360,6 +361,37 @@ function VoiceSettings() {
         </label>
       </div>
 
+      <h3 className="section-heading">Modo de entrada</h3>
+      {[
+        ['voice', 'Detecção de voz', 'Sua voz é transmitida quando você fala.'],
+        ['ptt', 'Pressione para falar', 'Sua voz só é transmitida enquanto você segura o atalho.'],
+      ].map(([id, label, hint]) => (
+        <button key={id} className={`radio-card${settings.inputMode === id ? ' selected' : ''}`} onClick={() => updateSettings({ inputMode: id })}>
+          <span><b>{label}</b><small>{hint}</small></span>
+          <span className="radio-dot" />
+        </button>
+      ))}
+      {settings.inputMode === 'ptt' && (
+        <div className="two-columns ptt-settings">
+          <div className="field">
+            <span className="field-label">Atalho</span>
+            <KeybindInput value={settings.pttKey} onChange={(pttKey) => updateSettings({ pttKey })} />
+            {settings.pttKey && !settings.pttKey.vk && isDesktop && (
+              <p className="muted small">Essa tecla só funciona com o app em foco.</p>
+            )}
+            {!isDesktop && <p className="muted small">No navegador, o atalho só funciona com a aba em foco. Use o app desktop para usá-lo em qualquer lugar.</p>}
+          </div>
+          <label className="field">
+            <span className="field-label">Atraso ao soltar o Pressione para falar</span>
+            <div className="slider-row">
+              <input type="range" min={0} max={2000} step={10} value={settings.pttDelay} onChange={(e) => updateSettings({ pttDelay: Number(e.target.value) })} />
+              <span>{settings.pttDelay} ms</span>
+            </div>
+          </label>
+        </div>
+      )}
+
+      <div className="divider" />
       <h3 className="section-heading">Teste de microfone</h3>
       <p className="muted small">Está com problemas no microfone? Comece um teste e diga algo engraçado — vamos reproduzir sua voz para você.</p>
       <div className="mic-test">
@@ -369,14 +401,18 @@ function VoiceSettings() {
         <div className="level-meter"><span style={{ width: `${testing ? meterPercent : 0}%` }} /></div>
       </div>
 
-      <div className="divider" />
-      <h3 className="section-heading">Sensibilidade de entrada</h3>
-      <ToggleRow
-        title="Determinar automaticamente a sensibilidade de entrada"
-        checked={settings.autoSensitivity}
-        onChange={(autoSensitivity) => updateSettings({ autoSensitivity })}
-      />
-      {!settings.autoSensitivity && (
+      {settings.inputMode !== 'ptt' && (
+        <>
+          <div className="divider" />
+          <h3 className="section-heading">Sensibilidade de entrada</h3>
+          <ToggleRow
+            title="Determinar automaticamente a sensibilidade de entrada"
+            checked={settings.autoSensitivity}
+            onChange={(autoSensitivity) => updateSettings({ autoSensitivity })}
+          />
+        </>
+      )}
+      {settings.inputMode !== 'ptt' && !settings.autoSensitivity && (
         <div className="sensitivity">
           <div className="level-meter threshold">
             <span style={{ width: `${testing ? meterPercent : 0}%` }} className={meterPercent > thresholdPercent ? 'open' : ''} />
@@ -396,6 +432,37 @@ function VoiceSettings() {
       <div className="divider" />
       <VideoSettings devices={devices.video} />
     </>
+  );
+}
+
+// Gravação do atalho do pressione para falar: a próxima tecla (ou botão lateral/do meio do mouse).
+// Esc cancela a gravação.
+function KeybindInput({ value, onChange }) {
+  const [recording, setRecording] = useState(false);
+  useEffect(() => {
+    if (!recording) return;
+    const onInput = (e) => {
+      const key = keyFromEvent(e);
+      if (e.type === 'mousedown' && !key) return; // clique comum (ex.: no próprio botão)
+      e.preventDefault();
+      e.stopPropagation();
+      if (key) onChange(key);
+      setRecording(false);
+    };
+    window.addEventListener('keydown', onInput, true);
+    window.addEventListener('mousedown', onInput, true);
+    return () => {
+      window.removeEventListener('keydown', onInput, true);
+      window.removeEventListener('mousedown', onInput, true);
+    };
+  }, [recording]);
+  return (
+    <div className={`ptt-keybind${recording ? ' recording' : ''}`}>
+      <span className="ptt-keybind-value">{recording ? 'Pressione uma tecla…' : value?.name ?? 'Nenhum atalho'}</span>
+      <button className="button secondary small" onClick={() => setRecording(!recording)}>
+        {recording ? 'Parar gravação' : value ? 'Editar atalho' : 'Gravar atalho'}
+      </button>
+    </div>
   );
 }
 
@@ -490,11 +557,14 @@ const KEYBINDS = [
 ];
 
 function Keybinds() {
+  const { inputMode, pttKey } = useSettings();
+  // O atalho do pressione para falar é configurado em Voz e vídeo; aqui só aparece quando está em uso.
+  const rows = inputMode === 'ptt' && pttKey ? [['Pressione para falar (segure)', [pttKey.name]], ...KEYBINDS] : KEYBINDS;
   return (
     <>
       <h2 className="page-title">Atalhos de teclado</h2>
       <div className="keybinds">
-        {KEYBINDS.map(([label, keys]) => (
+        {rows.map(([label, keys]) => (
           <div key={label} className="keybind">
             <span>{label}</span>
             <span>{keys.map((k) => <kbd key={k}>{k}</kbd>)}</span>

@@ -26,4 +26,13 @@ contextBridge.exposeInMainWorld('CloneNative', {
     getSources: () => ipcRenderer.invoke('CLONE_SCREEN_GET_SOURCES'),
     select: (id) => ipcRenderer.send('CLONE_SCREEN_SELECT', String(id)),
   },
+  // Pressione para falar: a tecla (código virtual do Windows, ou null para parar) é lida fora de foco.
+  ptt: {
+    setKey: (vk) => ipcRenderer.send('CLONE_PTT_SET_KEY', vk === null ? null : Number(vk)),
+    onChange: (callback) => {
+      const listener = (_event, down) => callback(!!down);
+      ipcRenderer.on('CLONE_PTT_STATE', listener);
+      return () => ipcRenderer.removeListener('CLONE_PTT_STATE', listener);
+    },
+  },
 });

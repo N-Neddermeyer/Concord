@@ -1,5 +1,8 @@
 import { useSyncExternalStore } from 'react';
+import { api } from './api.js';
 import { OP, gateway } from './gateway.js';
+import { eventCode } from './keys.js';
+import { native } from './native.js';
 import { getSettings, onSettingsChange, updateSettings } from './settings.js';
 import { playSound } from './sounds.js';
 import { showError } from './dialogs.js';
@@ -7,10 +10,12 @@ import { dispatch, getState } from './store.js';
 
 // Voz em malha (mesh): cada participante abre uma RTCPeerConnection com cada outro.
 // Quem entra no canal manda a oferta para quem já está lá; o gateway só repassa
-// os sinais (op 30). Serve para grupos pequenos — o Discord real usa um SFU.
+// os sinais (op 30). Serve para grupos pequenos — o Discord real usa um SFU. Os servidores
+// STUN/TURN vêm do servidor (/voice/ice-servers); sem eles, só a rede local funciona.
 //
-// Como no Discord, a transmissão é por detecção de voz: o microfone bruto alimenta o
-// medidor, e uma cópia da trilha (a enviada aos outros) só fica ativa enquanto há fala.
+// Como no Discord, a transmissão é por detecção de voz ou por pressione para falar: o microfone
+// bruto alimenta o medidor, e uma cópia da trilha (a enviada aos outros) só fica ativa enquanto
+// há fala (ou enquanto a tecla está pressionada).
 //
 // Cada conexão nasce com quatro transceptores fixos (voz, câmera, tela e som da tela, nessa
 // ordem), e ligar ou desligar a câmera/tela só troca a trilha (replaceTrack), sem renegociar.
@@ -115,9 +120,15 @@ class Voice {
   meters = new Map(); // userId -> { analyser, source, buffer, speaking, lastLoud }
   audioContext = null;
   master = null; // ganho principal: volume de saída e ensurdecer
+  pttSources = { page: false, global: false }; // pressione para falar: tecla pressionada (na página / fora de foco)
+  pttActive = false; // transmitindo pelo pressione para falar (inclui o atraso ao soltar)
+  pttTimer = null;
+  ice = null; // { ice_servers, ice_transport_policy, ttl } do servidor
+  iceTimer = null;
+  retries = new Map(); // userId -> tentativas de reconexão seguidas
   timer = null;
   listeners = new Set();
-  snapshot = { guildId: null, channelId: null, muted: false, deafened: false, video: false, streaming: false, screenAudio: false, tracks: 0 };
+  snapshot = { guildId: null, channelId: null, muted: false, deafened: false, video: false, streaming: false, screenAudio: false, transmitting: null, tracks: 0 };
   trackVersion = 0; // muda a cada trilha de vídeo nova (local ou remota), para a interface reler
 
   constructor() {
@@ -130,7 +141,73 @@ class Voice {
       if (micChanged && this.mic) this.reopenMic();
       if (cameraChanged && this.camera) this.reopenCamera();
       this.applyOutput();
+      this.syncPtt();
     });
+
+    // Pressione para falar com a janela em foco (no desktop, a tecla também é lida fora de foco).
+    const press = (down) => (e) => {
+      const { inputMode, pttKey } = getSettings();
+      if (inputMode !== 'ptt' || !pttKey || eventCode(e) !== pttKey.code) return;
+      if (e.type.startsWith('mouse')) e.preventDefault(); // os botões laterais não voltam a página
+      this.setPtt('page', down);
+    };
+    window.addEventListener('keydown', press(true), true);
+    window.addEventListener('keyup', press(false), true);
+    window.addEventListener('mousedown', press(true), true);
+    window.addEventListener('mouseup', press(false), true);
+    window.addEventListener('blur', () => this.setPtt('page', false));
+    native?.ptt?.onChange((down) => this.setPtt('global', down));
+    this.syncPtt(); // página recarregada: para a leitura que tenha ficado ligada
+  }
+
+  // --- pressione para falar ---
+
+  get pttMode() {
+    return getSettings().inputMode === 'ptt';
+  }
+
+  // Duas fontes: a página (teclado/mouse em foco) e o desktop (tecla lida fora de foco).
+  // Transmite enquanto qualquer uma estiver pressionada; ao soltar, espera o atraso configurado.
+  setPtt(source, down) {
+    this.pttSources[source] = down;
+    const pressed = this.pttSources.page || this.pttSources.global;
+    clearTimeout(this.pttTimer);
+    if (pressed) {
+      this.setTransmitting(true);
+    } else if (this.pttActive) {
+      this.pttTimer = setTimeout(() => this.setTransmitting(false), getSettings().pttDelay);
+    }
+  }
+
+  setTransmitting(active) {
+    if (this.pttActive === active) return;
+    this.pttActive = active;
+    this.updateSendTrack();
+    this.emit();
+  }
+
+  // No desktop, liga a leitura da tecla fora de foco só durante a chamada no modo pressione para falar.
+  syncPtt() {
+    const { pttKey } = getSettings();
+    const vk = this.channelId && this.pttMode && pttKey?.vk ? pttKey.vk : null;
+    native?.ptt?.setKey(vk);
+    if (!vk) this.pttSources.global = false;
+    if (!this.pttMode || !this.channelId) {
+      this.pttSources.page = false;
+      clearTimeout(this.pttTimer);
+      this.pttActive = false;
+    }
+    this.updateSendTrack();
+  }
+
+  // Servidores STUN/TURN do servidor (vazio = só rede local). Senhas temporárias do TURN são
+  // renovadas na metade da validade, para as conexões novas de uma chamada longa.
+  async loadIce() {
+    this.ice = await api('/voice/ice-servers').catch(() => null);
+    clearTimeout(this.iceTimer);
+    if (this.ice?.ice_servers.some((s) => s.credential)) {
+      this.iceTimer = setTimeout(() => this.channelId && this.loadIce(), (this.ice.ttl * 1000) / 2);
+    }
   }
 
   emit() {
@@ -142,6 +219,7 @@ class Voice {
       video: !!this.camera,
       streaming: !!this.screen,
       screenAudio: !!this.screenAudio,
+      transmitting: this.pttMode ? this.pttActive : null,
       tracks: this.trackVersion,
     };
     for (const listener of this.listeners) listener();
@@ -151,16 +229,19 @@ class Voice {
     if (this.channelId === channelId) return;
     if (this.channelId) this.leave();
 
+    const ice = this.loadIce();
     try {
       await this.openMic();
     } catch (e) {
       showError(`Não foi possível acessar o microfone: ${e.message}`);
       return;
     }
+    await ice;
 
     this.guildId = guildId;
     this.channelId = channelId;
     this.confirmed = false;
+    this.syncPtt();
     this.sendState();
     this.emit();
   }
@@ -330,7 +411,7 @@ class Voice {
   }
 
   updateSendTrack() {
-    if (this.sendTrack) this.sendTrack.enabled = !this.muted && this.gateOpen;
+    if (this.sendTrack) this.sendTrack.enabled = !this.muted && (this.pttMode ? this.pttActive : this.gateOpen);
   }
 
   applyOutput() {
@@ -379,6 +460,9 @@ class Voice {
     this.guildId = null;
     this.channelId = null;
     this.confirmed = false;
+    clearTimeout(this.iceTimer);
+    this.retries.clear();
+    this.syncPtt();
     this.emit();
   }
 
@@ -414,7 +498,10 @@ class Voice {
   // Quem oferta cria os transceptores (voz, câmera, tela, som da tela); quem responde os recebe
   // da oferta e só preenche as trilhas (attachTracks), na mesma ordem.
   createPeer(userId, offering) {
-    const pc = new RTCPeerConnection({ iceServers: [] }); // rede local: candidatos "host" bastam
+    const pc = new RTCPeerConnection({
+      iceServers: this.ice?.ice_servers ?? [],
+      iceTransportPolicy: this.ice?.ice_transport_policy ?? 'all',
+    });
     const peer = { pc, pendingIce: [], video: { camera: null, screen: null }, sound: { voice: null, stream: null } };
     this.peers.set(userId, peer);
 
@@ -442,7 +529,8 @@ class Voice {
       if (kind === 'voice') this.watch(userId, peer.sound.voice.stream);
     };
     pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'failed') this.closePeer(userId);
+      if (pc.connectionState === 'connected') this.retries.delete(userId);
+      if (pc.connectionState === 'failed' && this.peers.get(userId)?.pc === pc) this.reconnect(userId);
     };
     return peer;
   }
@@ -461,6 +549,24 @@ class Voice {
       sound.direction = 'sendrecv';
       sound.sender.replaceTrack(this.screenAudio).catch(() => {});
     }
+  }
+
+  // Conexão caída (rede trocou, TURN expirou…): fecha e, se a pessoa continua no canal, quem tem
+  // o menor id chama de novo (o outro lado troca a conexão ao receber a oferta; se for ele quem
+  // percebeu a queda, pede a chamada com o sinal "restart"). Até 5 tentativas, esperando 1, 2, 4,
+  // 8 e 15 s.
+  reconnect(userId) {
+    this.closePeer(userId);
+    const me = getState().user.id;
+    if (BigInt(me) > BigInt(userId)) return this.signal(userId, { type: 'restart' });
+    const attempt = this.retries.get(userId) ?? 0;
+    if (attempt >= 5) return;
+    this.retries.set(userId, attempt + 1);
+    const channelId = this.channelId;
+    setTimeout(() => {
+      const stillHere = this.channelId === channelId && getState().voiceStates[userId]?.channel_id === channelId;
+      if (stillHere && !this.peers.has(userId)) this.call(userId);
+    }, Math.min(1000 * 2 ** attempt, 15000));
   }
 
   async call(userId) {
@@ -484,6 +590,8 @@ class Voice {
     } else if (message.type === 'answer' && peer) {
       await peer.pc.setRemoteDescription(message.sdp);
       await this.flushIce(peer);
+    } else if (message.type === 'restart') {
+      if (!peer || peer.pc.connectionState !== 'connected') this.reconnect(from);
     } else if (message.type === 'ice' && peer) {
       if (peer.pc.remoteDescription) await peer.pc.addIceCandidate(message.candidate).catch(() => {});
       else peer.pendingIce.push(message.candidate);
@@ -514,6 +622,36 @@ class Voice {
       this.emit();
     }
     this.unwatch(userId);
+  }
+
+  // --- conexão (painel "Conexão de voz") ---
+
+  // Por pessoa: caminho do par de candidatos escolhido (rede local, STUN ou TURN), protocolo e ping.
+  async connectionStats() {
+    const result = [];
+    for (const [userId, { pc }] of this.peers) {
+      const entry = { userId, state: pc.connectionState, route: null, protocol: null, ping: null };
+      try {
+        const stats = await pc.getStats();
+        let pair = null;
+        stats.forEach((r) => {
+          if (r.type === 'transport' && r.selectedCandidatePairId) pair = stats.get(r.selectedCandidatePairId);
+        });
+        if (!pair) stats.forEach((r) => { if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') pair = r; });
+        if (pair) {
+          const local = stats.get(pair.localCandidateId);
+          const remote = stats.get(pair.remoteCandidateId);
+          const types = [local?.candidateType, remote?.candidateType];
+          entry.route = types.includes('relay') ? 'relay' : types.some((t) => t === 'srflx' || t === 'prflx') ? 'stun' : 'local';
+          entry.protocol = local?.relayProtocol ?? local?.protocol ?? null;
+          if (pair.currentRoundTripTime !== undefined) entry.ping = Math.round(pair.currentRoundTripTime * 1000);
+        }
+      } catch {
+        // conexão fechando
+      }
+      result.push(entry);
+    }
+    return result;
   }
 
   // --- detecção de voz (anel verde e liberação da trilha enviada) ---
@@ -551,7 +689,7 @@ class Voice {
         this.updateSendTrack();
       }
       // Quem eu silenciei não acende o anel de fala (como no Discord).
-      const speaking = active && (userId === me ? !this.muted : !userAudio(userId).muted);
+      const speaking = active && (userId === me ? !this.muted && (!this.pttMode || this.pttActive) : !userAudio(userId).muted);
       if (speaking !== meter.speaking) {
         meter.speaking = speaking;
         dispatch({ type: 'SPEAKING', d: { user_id: userId, speaking } });
